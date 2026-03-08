@@ -28,7 +28,6 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         nightlyToolchain = pkgs.rust-bin.nightly.latest.default.override {
           extensions = [
@@ -36,54 +35,15 @@
             "rustfmt"
           ];
         };
-        craneLib = crane.mkLib pkgs;
-        craneLibStable = craneLib.overrideToolchain rustToolchain;
-        craneLibNightly = craneLib.overrideToolchain nightlyToolchain;
-        hasCargoManifest = builtins.pathExists ./Cargo.toml;
-
-        cargoChecks =
-          if hasCargoManifest then
-            let
-              cargoSrc = craneLibStable.cleanCargoSource ./.;
-              commonArgs = {
-                src = cargoSrc;
-                strictDeps = true;
-              };
-              cargoArtifacts = craneLibStable.buildDepsOnly commonArgs;
-            in
-            {
-              cargo-fmt = craneLibNightly.cargoFmt {
-                src = cargoSrc;
-                cargoExtraArgs = "--all";
-              };
-
-              cargo-clippy = craneLibNightly.cargoClippy (
-                commonArgs
-                // {
-                  inherit cargoArtifacts;
-                  cargoExtraArgs = "--locked";
-                  cargoClippyExtraArgs = "--workspace --all-targets --all-features -- -D warnings";
-                }
-              );
-
-              cargo-build = craneLibStable.cargoBuild (
-                commonArgs
-                // {
-                  inherit cargoArtifacts;
-                  cargoExtraArgs = "--locked --workspace --all-targets --all-features";
-                }
-              );
-
-              cargo-test = craneLibStable.cargoTest (
-                commonArgs
-                // {
-                  inherit cargoArtifacts;
-                  cargoExtraArgs = "--locked --workspace --all-targets --all-features";
-                }
-              );
-            }
-          else
-            { };
+        cargoChecks = import ./nix/crane-checks.nix {
+          inherit
+            pkgs
+            crane
+            rustToolchain
+            nightlyToolchain
+            ;
+          src = ./.;
+        };
       in
       {
         formatter = pkgs.nixfmt;
@@ -91,6 +51,7 @@
         checks = {
           nixfmt = pkgs.runCommandLocal "nixfmt-check" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
             nixfmt --check ${./flake.nix}
+            nixfmt --check ${./nix/crane-checks.nix}
             touch $out
           '';
         }
