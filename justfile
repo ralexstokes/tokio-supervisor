@@ -16,7 +16,8 @@ build:
 test:
     cargo test --workspace --all-targets --all-features
 
-ci: fmt lint build test
+ci:
+    nix flake check --no-update-lock-file --print-build-logs
 
 doc:
     cargo doc --workspace --no-deps --open
