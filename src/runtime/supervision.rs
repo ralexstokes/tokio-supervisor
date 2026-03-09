@@ -50,6 +50,7 @@ pub(crate) struct SupervisorRuntime {
     pub(crate) state: SupervisorState,
     pub(crate) group_token: CancellationToken,
     pub(crate) join_set: JoinSet<ChildEnvelope>,
+    pub(crate) child_order: Vec<String>,
     pub(crate) children: HashMap<String, ChildRuntime>,
     pub(crate) restart_times: VecDeque<Instant>,
     pub(crate) events: broadcast::Sender<SupervisorEvent>,
@@ -65,6 +66,7 @@ impl SupervisorRuntime {
         shutdown_rx: watch::Receiver<bool>,
         events: broadcast::Sender<SupervisorEvent>,
     ) -> Self {
+        let child_order: Vec<String> = config.children.iter().map(|s| s.id.clone()).collect();
         let children = config
             .children
             .into_iter()
@@ -80,6 +82,7 @@ impl SupervisorRuntime {
             state: SupervisorState::Running,
             group_token: CancellationToken::new(),
             join_set: JoinSet::new(),
+            child_order,
             children,
             restart_times: VecDeque::new(),
             events,
@@ -92,8 +95,8 @@ impl SupervisorRuntime {
 
     pub(crate) async fn run(&mut self) -> Result<SupervisorExit, SupervisorError> {
         self.send_event(SupervisorEvent::SupervisorStarted);
-        let initial_ids: Vec<String> = self.children.keys().cloned().collect();
-        for id in initial_ids {
+        for i in 0..self.child_order.len() {
+            let id = self.child_order[i].clone();
             self.spawn_child(&id)?;
         }
 
@@ -339,16 +342,22 @@ impl SupervisorRuntime {
     }
 
     fn no_running_children(&self) -> bool {
-        self.children
-            .values()
-            .all(|child| child.state == RuntimeChildState::Stopped)
+        self.child_order.iter().all(|id| {
+            self.children
+                .get(id.as_str())
+                .is_some_and(|child| child.state == RuntimeChildState::Stopped)
+        })
     }
 
     fn respawnable_child_ids(&self) -> Vec<String> {
-        self.children
+        self.child_order
             .iter()
-            .filter(|(_, child)| !matches!(child.spec.restart, Restart::Temporary))
-            .map(|(id, _)| id.clone())
+            .filter(|id| {
+                self.children
+                    .get(id.as_str())
+                    .is_some_and(|child| !matches!(child.spec.restart, Restart::Temporary))
+            })
+            .cloned()
             .collect()
     }
 

@@ -28,11 +28,13 @@ impl SupervisorRuntime {
     }
 
     fn cancel_running_children(&mut self) {
-        for child in self.children.values_mut() {
-            if matches!(
-                child.state,
-                RuntimeChildState::Running | RuntimeChildState::Starting
-            ) {
+        for id in self.child_order.iter().rev() {
+            if let Some(child) = self.children.get_mut(id.as_str())
+                && matches!(
+                    child.state,
+                    RuntimeChildState::Running | RuntimeChildState::Starting
+                )
+            {
                 child.state = RuntimeChildState::Stopping;
             }
         }
@@ -44,7 +46,10 @@ impl SupervisorRuntime {
         let mut abort_now = Vec::new();
         let mut max_grace = None;
 
-        for (id, child) in &self.children {
+        for id in &self.child_order {
+            let Some(child) = self.children.get(id.as_str()) else {
+                continue;
+            };
             if !matches!(
                 child.state,
                 RuntimeChildState::Running
@@ -115,39 +120,43 @@ impl SupervisorRuntime {
 
     fn abort_children_requiring_abort(&mut self) {
         let ids: Vec<String> = self
-            .children
+            .child_order
             .iter()
-            .filter(|(_, child)| {
-                matches!(
-                    child.state,
-                    RuntimeChildState::Running
-                        | RuntimeChildState::Starting
-                        | RuntimeChildState::Stopping
-                ) && matches!(
-                    child.spec.shutdown_policy.mode,
-                    ShutdownMode::CooperativeThenAbort | ShutdownMode::Abort
-                )
+            .filter(|id| {
+                self.children.get(id.as_str()).is_some_and(|child| {
+                    matches!(
+                        child.state,
+                        RuntimeChildState::Running
+                            | RuntimeChildState::Starting
+                            | RuntimeChildState::Stopping
+                    ) && matches!(
+                        child.spec.shutdown_policy.mode,
+                        ShutdownMode::CooperativeThenAbort | ShutdownMode::Abort
+                    )
+                })
             })
-            .map(|(id, _)| id.clone())
+            .cloned()
             .collect();
 
-        for id in ids {
-            self.abort_child(&id);
+        for id in &ids {
+            self.abort_child(id);
         }
     }
 
     fn remaining_cooperative_ids(&self) -> Vec<String> {
-        self.children
+        self.child_order
             .iter()
-            .filter(|(_, child)| {
-                matches!(
-                    child.state,
-                    RuntimeChildState::Running
-                        | RuntimeChildState::Starting
-                        | RuntimeChildState::Stopping
-                ) && matches!(child.spec.shutdown_policy.mode, ShutdownMode::Cooperative)
+            .filter(|id| {
+                self.children.get(id.as_str()).is_some_and(|child| {
+                    matches!(
+                        child.state,
+                        RuntimeChildState::Running
+                            | RuntimeChildState::Starting
+                            | RuntimeChildState::Stopping
+                    ) && matches!(child.spec.shutdown_policy.mode, ShutdownMode::Cooperative)
+                })
             })
-            .map(|(id, _)| id.clone())
+            .cloned()
             .collect()
     }
 
