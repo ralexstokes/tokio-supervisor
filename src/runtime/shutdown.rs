@@ -58,10 +58,7 @@ impl SupervisorRuntime {
             match child.spec.shutdown_policy.mode {
                 ShutdownMode::Abort => abort_now.push(id.clone()),
                 ShutdownMode::Cooperative | ShutdownMode::CooperativeThenAbort => {
-                    max_grace = match max_grace {
-                        Some(current) => Some(current.max(grace)),
-                        None => Some(grace),
-                    };
+                    max_grace = Some(max_grace.map_or(grace, |current| current.max(grace)));
                 }
             }
         }

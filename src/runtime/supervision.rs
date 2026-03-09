@@ -165,10 +165,7 @@ impl SupervisorRuntime {
                     self.handle_one_for_one_restart(classified.id, classified.generation)
                         .await?
                 }
-                Strategy::OneForAll => {
-                    self.handle_one_for_all_restart(classified.id, classified.generation)
-                        .await?
-                }
+                Strategy::OneForAll => self.handle_one_for_all_restart(classified.id).await?,
             }
         } else {
             self.record_terminal_status(&classified.id, classified.generation, &classified.status);
@@ -284,7 +281,6 @@ impl SupervisorRuntime {
     async fn handle_one_for_all_restart(
         &mut self,
         failing_id: String,
-        _previous_generation: u64,
     ) -> Result<(), SupervisorError> {
         let delay = self.schedule_restart(None)?;
         self.send_event(SupervisorEvent::GroupRestartScheduled { delay });

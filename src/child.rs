@@ -1,13 +1,10 @@
-use std::{future::Future, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
-use crate::{
-    context::ChildContext,
-    restart::Restart,
-    runtime::child_factory::{ChildFactory, make_child_factory},
-    shutdown::ShutdownPolicy,
-};
+use crate::{context::ChildContext, restart::Restart, shutdown::ShutdownPolicy};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+pub(crate) type ChildFuture = Pin<Box<dyn Future<Output = ChildResult> + Send + 'static>>;
 
 #[derive(Debug)]
 pub enum ChildResult {
@@ -20,11 +17,38 @@ pub struct ChildSpec {
     pub(crate) inner: Arc<ChildSpecInner>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ChildSpecInner {
     pub(crate) id: String,
     pub(crate) restart: Restart,
     pub(crate) shutdown_policy: ShutdownPolicy,
     pub(crate) factory: Arc<dyn ChildFactory>,
+}
+
+pub(crate) trait ChildFactory: Send + Sync + 'static {
+    fn make(&self, ctx: ChildContext) -> ChildFuture;
+}
+
+struct ClosureFactory<F> {
+    f: F,
+}
+
+impl<F, Fut> ChildFactory for ClosureFactory<F>
+where
+    F: Fn(ChildContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ChildResult> + Send + 'static,
+{
+    fn make(&self, ctx: ChildContext) -> ChildFuture {
+        Box::pin((self.f)(ctx))
+    }
+}
+
+fn make_child_factory<F, Fut>(f: F) -> Arc<dyn ChildFactory>
+where
+    F: Fn(ChildContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ChildResult> + Send + 'static,
+{
+    Arc::new(ClosureFactory { f })
 }
 
 impl ChildSpec {
@@ -44,24 +68,18 @@ impl ChildSpec {
     }
 
     pub fn restart(self, restart: Restart) -> Self {
+        let mut inner = Arc::unwrap_or_clone(self.inner);
+        inner.restart = restart;
         Self {
-            inner: Arc::new(ChildSpecInner {
-                id: self.inner.id.clone(),
-                restart,
-                shutdown_policy: self.inner.shutdown_policy,
-                factory: Arc::clone(&self.inner.factory),
-            }),
+            inner: Arc::new(inner),
         }
     }
 
     pub fn shutdown(self, policy: ShutdownPolicy) -> Self {
+        let mut inner = Arc::unwrap_or_clone(self.inner);
+        inner.shutdown_policy = policy;
         Self {
-            inner: Arc::new(ChildSpecInner {
-                id: self.inner.id.clone(),
-                restart: self.inner.restart,
-                shutdown_policy: policy,
-                factory: Arc::clone(&self.inner.factory),
-            }),
+            inner: Arc::new(inner),
         }
     }
 
