@@ -1,5 +1,3 @@
-use tokio_util::sync::CancellationToken;
-
 use crate::{
     context::ChildContext,
     error::SupervisorError,
@@ -28,25 +26,28 @@ impl SupervisorRuntime {
         }
 
         let generation = child.generation;
-        let child_token = CancellationToken::child_token(&self.group_token);
+        let child_token = self.group_token.child_token();
         child.active_token = Some(child_token.clone());
         child.state = RuntimeChildState::Starting;
 
+        let owned_id = id.to_owned();
         let ctx = ChildContext {
-            id: id.to_owned(),
+            id: owned_id.clone(),
             generation,
             token: child_token,
             supervisor_token: self.group_token.clone(),
         };
         let future = child.spec.factory.make(ctx);
-        let owned_id = id.to_owned();
 
-        let abort_handle = self.join_set.spawn(async move {
-            let result = future.await;
-            ChildEnvelope {
-                id: owned_id,
-                generation,
-                result,
+        let abort_handle = self.join_set.spawn({
+            let id = owned_id.clone();
+            async move {
+                let result = future.await;
+                ChildEnvelope {
+                    id,
+                    generation,
+                    result,
+                }
             }
         });
         let task_id = abort_handle.id();
@@ -57,12 +58,12 @@ impl SupervisorRuntime {
         self.task_map.insert(
             task_id,
             TaskMeta {
-                id: id.to_owned(),
+                id: owned_id.clone(),
                 generation,
             },
         );
         self.send_event(SupervisorEvent::ChildStarted {
-            id: id.to_owned(),
+            id: owned_id,
             generation,
         });
 

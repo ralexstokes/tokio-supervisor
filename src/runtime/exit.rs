@@ -14,8 +14,8 @@ pub(crate) enum ExitStatus {
 impl ExitStatus {
     pub(crate) fn from_child_result(result: ChildResult) -> Self {
         match result {
-            ChildResult::Completed => Self::Completed,
-            ChildResult::Failed(err) => Self::Failed(err),
+            Ok(()) => Self::Completed,
+            Err(err) => Self::Failed(err),
         }
     }
 

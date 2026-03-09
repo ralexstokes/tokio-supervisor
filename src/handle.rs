@@ -14,14 +14,30 @@ type SupervisorJoinHandle = JoinHandle<Result<SupervisorExit, SupervisorError>>;
 
 #[derive(Clone)]
 pub struct SupervisorHandle {
-    pub(crate) shutdown_tx: watch::Sender<bool>,
-    pub(crate) done_rx: watch::Receiver<Option<Result<SupervisorExit, SupervisorError>>>,
-    pub(crate) done_tx: watch::Sender<Option<Result<SupervisorExit, SupervisorError>>>,
-    pub(crate) events_tx: broadcast::Sender<SupervisorEvent>,
-    pub(crate) join_handle: Arc<Mutex<Option<SupervisorJoinHandle>>>,
+    shutdown_tx: watch::Sender<bool>,
+    done_rx: watch::Receiver<Option<Result<SupervisorExit, SupervisorError>>>,
+    done_tx: watch::Sender<Option<Result<SupervisorExit, SupervisorError>>>,
+    events_tx: broadcast::Sender<SupervisorEvent>,
+    join_handle: Arc<Mutex<Option<SupervisorJoinHandle>>>,
 }
 
 impl SupervisorHandle {
+    pub(crate) fn new(
+        shutdown_tx: watch::Sender<bool>,
+        done_tx: watch::Sender<Option<Result<SupervisorExit, SupervisorError>>>,
+        done_rx: watch::Receiver<Option<Result<SupervisorExit, SupervisorError>>>,
+        events_tx: broadcast::Sender<SupervisorEvent>,
+        join_handle: SupervisorJoinHandle,
+    ) -> Self {
+        Self {
+            shutdown_tx,
+            done_tx,
+            done_rx,
+            events_tx,
+            join_handle: Arc::new(Mutex::new(Some(join_handle))),
+        }
+    }
+
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
     }

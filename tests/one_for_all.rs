@@ -7,9 +7,7 @@ use tokio::{
     sync::{Barrier, Notify, mpsc},
     time::{Duration, timeout},
 };
-use tokio_supervisor::{
-    ChildResult, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit,
-};
+use tokio_supervisor::{ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit};
 
 mod common;
 
@@ -27,11 +25,11 @@ async fn restartable_child_failure_restarts_the_whole_group() {
                 .send(ctx.generation)
                 .expect("test receiver dropped");
             if trigger_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                return ChildResult::Failed(common::test_error("restart group"));
+                return Err(common::test_error("restart group"));
             }
 
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Transient);
@@ -41,7 +39,7 @@ async fn restartable_child_failure_restarts_the_whole_group() {
         async move {
             peer_tx.send(ctx.generation).expect("test receiver dropped");
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Permanent);
@@ -78,7 +76,7 @@ async fn completed_temporary_child_is_not_respawned_during_group_restart() {
             temporary_tx
                 .send(ctx.generation)
                 .expect("test receiver dropped");
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Temporary);
@@ -94,11 +92,11 @@ async fn completed_temporary_child_is_not_respawned_during_group_restart() {
                 .expect("test receiver dropped");
             if trigger_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 release_failure.notified().await;
-                return ChildResult::Failed(common::test_error("restart group"));
+                return Err(common::test_error("restart group"));
             }
 
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Transient);
@@ -108,7 +106,7 @@ async fn completed_temporary_child_is_not_respawned_during_group_restart() {
         async move {
             peer_tx.send(ctx.generation).expect("test receiver dropped");
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Permanent);
@@ -154,11 +152,11 @@ async fn one_for_all_does_not_overlap_old_and_new_generations() {
                 .send(ctx.generation)
                 .expect("test receiver dropped");
             if trigger_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                return ChildResult::Failed(common::test_error("restart group"));
+                return Err(common::test_error("restart group"));
             }
 
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Transient);
@@ -174,7 +172,7 @@ async fn one_for_all_does_not_overlap_old_and_new_generations() {
 
             ctx.token.cancelled().await;
             live_instances.fetch_sub(1, Ordering::SeqCst);
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Permanent);
@@ -222,11 +220,11 @@ async fn drained_old_generation_failure_does_not_poison_later_completed_exit() {
                 .expect("test receiver dropped");
             if trigger_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 release_failure.notified().await;
-                return ChildResult::Failed(common::test_error("restart group"));
+                return Err(common::test_error("restart group"));
             }
 
             finish_generation_one.wait().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Transient);
@@ -240,11 +238,11 @@ async fn drained_old_generation_failure_does_not_poison_later_completed_exit() {
             peer_tx.send(ctx.generation).expect("test receiver dropped");
             if peer_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 ctx.token.cancelled().await;
-                return ChildResult::Failed(common::test_error("drained old generation"));
+                return Err(common::test_error("drained old generation"));
             }
 
             finish_generation_one.wait().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Transient);

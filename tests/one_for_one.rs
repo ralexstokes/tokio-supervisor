@@ -7,9 +7,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, sleep, timeout},
 };
-use tokio_supervisor::{
-    ChildResult, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit,
-};
+use tokio_supervisor::{ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit};
 
 mod common;
 
@@ -29,11 +27,11 @@ async fn failed_transient_child_restarts_and_sibling_keeps_running() {
                 .send(ctx.generation)
                 .expect("test receiver dropped");
             if flaky_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                return ChildResult::Failed(common::test_error("boom"));
+                return Err(common::test_error("boom"));
             }
 
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Transient);
@@ -48,7 +46,7 @@ async fn failed_transient_child_restarts_and_sibling_keeps_running() {
                 .expect("test receiver dropped");
             loop {
                 tokio::select! {
-                    _ = ctx.token.cancelled() => return ChildResult::Completed,
+                    _ = ctx.token.cancelled() => return Ok(()),
                     _ = sleep(Duration::from_millis(10)) => {
                         sibling_ticks_for_child.fetch_add(1, Ordering::SeqCst);
                     }
@@ -96,11 +94,11 @@ async fn permanent_child_restarts_after_completion() {
                 .send(ctx.generation)
                 .expect("test receiver dropped");
             if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                return ChildResult::Completed;
+                return Ok(());
             }
 
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Permanent);
@@ -131,7 +129,7 @@ async fn temporary_child_does_not_restart() {
                     starts_tx
                         .send(ctx.generation)
                         .expect("test receiver dropped");
-                    ChildResult::Failed(common::test_error("no restart"))
+                    Err(common::test_error("no restart"))
                 }
             })
             .restart(Restart::Temporary),

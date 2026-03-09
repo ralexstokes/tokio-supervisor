@@ -4,13 +4,9 @@ use crate::{context::ChildContext, restart::Restart, shutdown::ShutdownPolicy};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-pub(crate) type ChildFuture = Pin<Box<dyn Future<Output = ChildResult> + Send + 'static>>;
+pub type ChildResult = Result<(), BoxError>;
 
-#[derive(Debug)]
-pub enum ChildResult {
-    Completed,
-    Failed(BoxError),
-}
+pub(crate) type ChildFuture = Pin<Box<dyn Future<Output = ChildResult> + Send + 'static>>;
 
 #[derive(Clone)]
 pub struct ChildSpec {

@@ -4,9 +4,7 @@ use std::sync::{
 };
 
 use tokio::sync::mpsc;
-use tokio_supervisor::{
-    ChildResult, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit,
-};
+use tokio_supervisor::{ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit};
 
 mod common;
 
@@ -29,7 +27,7 @@ async fn transient_child_panic_causes_restart() {
                     }
 
                     ctx.token.cancelled().await;
-                    ChildResult::Completed
+                    Ok(())
                 }
             })
             .restart(Restart::Transient),
@@ -64,7 +62,7 @@ async fn one_for_all_panic_restarts_the_whole_group() {
             }
 
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Transient);
@@ -74,7 +72,7 @@ async fn one_for_all_panic_restarts_the_whole_group() {
         async move {
             peer_tx.send(ctx.generation).expect("test receiver dropped");
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Permanent);

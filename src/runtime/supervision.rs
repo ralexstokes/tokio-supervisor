@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use tokio::{
     sync::{broadcast, watch},
@@ -12,7 +9,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use crate::{
-    child::ChildResult,
     error::{SupervisorError, SupervisorExit},
     event::SupervisorEvent,
     restart::Restart,
@@ -23,13 +19,13 @@ use crate::{
 use super::{
     child_runtime::{ChildRuntime, RuntimeChildState},
     exit::ExitStatus,
-    intensity::{compute_backoff, intensity_exceeded, prune_restart_window, record_restart},
+    intensity::RestartTracker,
 };
 
 pub(crate) struct ChildEnvelope {
     pub(crate) id: String,
     pub(crate) generation: u64,
-    pub(crate) result: ChildResult,
+    pub(crate) result: crate::child::ChildResult,
 }
 
 #[derive(Clone)]
@@ -46,13 +42,12 @@ pub(crate) enum SupervisorState {
 
 pub(crate) struct SupervisorRuntime {
     pub(crate) strategy: Strategy,
-    pub(crate) intensity: crate::restart::RestartIntensity,
+    pub(crate) restart_tracker: RestartTracker,
     pub(crate) state: SupervisorState,
     pub(crate) group_token: CancellationToken,
     pub(crate) join_set: JoinSet<ChildEnvelope>,
     pub(crate) child_order: Vec<String>,
     pub(crate) children: HashMap<String, ChildRuntime>,
-    pub(crate) restart_times: VecDeque<Instant>,
     pub(crate) events: broadcast::Sender<SupervisorEvent>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     pub(crate) task_map: HashMap<Id, TaskMeta>,
@@ -78,13 +73,12 @@ impl SupervisorRuntime {
 
         Self {
             strategy: config.strategy,
-            intensity: config.restart_intensity,
+            restart_tracker: RestartTracker::new(config.restart_intensity),
             state: SupervisorState::Running,
             group_token: CancellationToken::new(),
             join_set: JoinSet::new(),
             child_order,
             children,
-            restart_times: VecDeque::new(),
             events,
             shutdown_rx,
             task_map: HashMap::new(),
@@ -95,8 +89,7 @@ impl SupervisorRuntime {
 
     pub(crate) async fn run(&mut self) -> Result<SupervisorExit, SupervisorError> {
         self.send_event(SupervisorEvent::SupervisorStarted);
-        for i in 0..self.child_order.len() {
-            let id = self.child_order[i].clone();
+        for id in self.child_order.clone() {
             self.spawn_child(&id)?;
         }
 
@@ -302,15 +295,13 @@ impl SupervisorRuntime {
     }
 
     fn schedule_restart(&mut self, child_id: Option<&str>) -> Result<Duration, SupervisorError> {
-        let now = Instant::now();
-        prune_restart_window(&mut self.restart_times, self.intensity.within, now);
-        record_restart(&mut self.restart_times, now);
-        if intensity_exceeded(&self.restart_times, self.intensity.max_restarts) {
+        self.restart_tracker.record(Instant::now());
+        if self.restart_tracker.exceeded() {
             self.send_event(SupervisorEvent::RestartIntensityExceeded);
             return Err(SupervisorError::RestartIntensityExceeded);
         }
 
-        let delay = compute_backoff(&self.intensity, self.restart_times.len());
+        let delay = self.restart_tracker.backoff();
         trace!(?child_id, ?delay, "scheduled child restart");
         Ok(delay)
     }

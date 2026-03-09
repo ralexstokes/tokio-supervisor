@@ -5,8 +5,7 @@ use std::sync::{
 
 use tokio::time::{Duration, sleep, timeout};
 use tokio_supervisor::{
-    BoxError, ChildResult, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorEvent,
-    SupervisorExit,
+    BoxError, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorEvent, SupervisorExit,
 };
 
 fn example_error(message: &'static str) -> BoxError {
@@ -26,12 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if attempt == 0 {
                 sleep(Duration::from_millis(100)).await;
                 println!("flaky-worker failed in generation {}", ctx.generation);
-                return ChildResult::Failed(example_error("simulated startup failure"));
+                return Err(example_error("simulated startup failure"));
             }
 
             ctx.token.cancelled().await;
             println!("flaky-worker observed shutdown");
-            ChildResult::Completed
+            Ok(())
         }
     })
     .restart(Restart::Transient);
@@ -40,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("metrics started in generation {}", ctx.generation);
         ctx.token.cancelled().await;
         println!("metrics observed shutdown");
-        ChildResult::Completed
+        Ok(())
     });
 
     let supervisor = SupervisorBuilder::new()

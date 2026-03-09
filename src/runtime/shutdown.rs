@@ -17,14 +17,14 @@ impl SupervisorRuntime {
         self.state = SupervisorState::Stopping;
         self.send_event(SupervisorEvent::SupervisorStopping);
         self.cancel_running_children();
-        self.drain_children(true).await?;
+        self.drain_children(DrainReason::Shutdown).await?;
         self.send_event(SupervisorEvent::SupervisorStopped);
         Ok(SupervisorExit::Shutdown)
     }
 
     pub(crate) async fn drain_for_group_restart(&mut self) -> Result<(), SupervisorError> {
         self.cancel_running_children();
-        self.drain_children(false).await
+        self.drain_children(DrainReason::GroupRestart).await
     }
 
     fn cancel_running_children(&mut self) {
@@ -42,7 +42,7 @@ impl SupervisorRuntime {
         self.group_token.cancel();
     }
 
-    async fn drain_children(&mut self, stopping_supervisor: bool) -> Result<(), SupervisorError> {
+    async fn drain_children(&mut self, reason: DrainReason) -> Result<(), SupervisorError> {
         let mut abort_now = Vec::new();
         let mut max_grace: Option<std::time::Duration> = None;
 
@@ -79,14 +79,7 @@ impl SupervisorRuntime {
                         let Some(joined) = maybe else {
                             break;
                         };
-                        self.handle_drained_join(
-                            joined,
-                            if stopping_supervisor {
-                                DrainReason::Shutdown
-                            } else {
-                                DrainReason::GroupRestart
-                            },
-                        )?;
+                        self.handle_drained_join(joined, reason)?;
                     }
                     _ = sleep_until(deadline) => {
                         break;
@@ -101,12 +94,13 @@ impl SupervisorRuntime {
             for id in &cooperative_timeouts {
                 self.abort_child(id);
             }
-            self.drain_join_set().await?;
+            self.abort_children_requiring_abort();
+            self.drain_join_set(reason).await?;
             return Err(SupervisorError::ShutdownTimedOut(ids));
         }
 
         self.abort_children_requiring_abort();
-        self.drain_join_set().await
+        self.drain_join_set(reason).await
     }
 
     fn abort_children_requiring_abort(&mut self) {
@@ -151,9 +145,9 @@ impl SupervisorRuntime {
         }
     }
 
-    async fn drain_join_set(&mut self) -> Result<(), SupervisorError> {
+    async fn drain_join_set(&mut self, reason: DrainReason) -> Result<(), SupervisorError> {
         while let Some(joined) = self.join_set.join_next_with_id().await {
-            self.handle_drained_join(joined, DrainReason::Shutdown)?;
+            self.handle_drained_join(joined, reason)?;
         }
         Ok(())
     }

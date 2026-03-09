@@ -8,7 +8,7 @@ use tokio::{
     time::{Duration, sleep, timeout},
 };
 use tokio_supervisor::{
-    BackoffPolicy, ChildResult, ChildSpec, Restart, RestartIntensity, ShutdownMode, ShutdownPolicy,
+    BackoffPolicy, ChildSpec, Restart, RestartIntensity, ShutdownMode, ShutdownPolicy,
     SupervisorBuilder, SupervisorEvent, SupervisorExit,
 };
 
@@ -28,7 +28,7 @@ async fn external_shutdown_stops_all_children() {
                 started_tx.send(()).expect("test receiver dropped");
                 ctx.token.cancelled().await;
                 exits.fetch_add(1, Ordering::SeqCst);
-                ChildResult::Completed
+                Ok(())
             }
         })
     };
@@ -54,7 +54,7 @@ async fn shutdown_is_idempotent_across_handle_clones() {
     let supervisor = SupervisorBuilder::new()
         .child(ChildSpec::new("worker", |ctx| async move {
             ctx.token.cancelled().await;
-            ChildResult::Completed
+            Ok(())
         }))
         .build()
         .expect("valid supervisor");
@@ -84,7 +84,7 @@ async fn cooperative_child_observes_cancellation_before_shutdown_finishes() {
             async move {
                 ctx.token.cancelled().await;
                 saw_cancel.store(true, Ordering::SeqCst);
-                ChildResult::Completed
+                Ok(())
             }
         }))
         .build()
@@ -189,7 +189,7 @@ async fn shutdown_preempts_zero_delay_restart() {
         })
         .child(
             ChildSpec::new("flaky", |_ctx| async move {
-                ChildResult::Failed(common::test_error("restart immediately"))
+                Err(common::test_error("restart immediately"))
             })
             .restart(Restart::Transient),
         )

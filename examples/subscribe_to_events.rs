@@ -1,6 +1,6 @@
 use tokio::time::{Duration, sleep};
 use tokio_supervisor::{
-    ChildResult, ChildSpec, ExitStatusView, SupervisorBuilder, SupervisorEvent, SupervisorExit,
+    ChildSpec, ExitStatusView, SupervisorBuilder, SupervisorEvent, SupervisorExit,
 };
 
 #[tokio::main]
@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("worker started");
             ctx.token.cancelled().await;
             println!("worker shutting down");
-            ChildResult::Completed
+            Ok(())
         }))
         .build()?;
 

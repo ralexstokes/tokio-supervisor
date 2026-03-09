@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::sync::{broadcast, watch};
 
@@ -47,13 +47,7 @@ impl Supervisor {
             result
         });
 
-        SupervisorHandle {
-            shutdown_tx,
-            done_rx,
-            done_tx,
-            events_tx,
-            join_handle: Arc::new(Mutex::new(Some(join_handle))),
-        }
+        SupervisorHandle::new(shutdown_tx, done_tx, done_rx, events_tx, join_handle)
     }
 }
 

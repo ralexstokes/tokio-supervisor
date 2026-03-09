@@ -1,8 +1,7 @@
 use std::time::{Duration, Instant};
 
 use tokio_supervisor::{
-    BackoffPolicy, ChildResult, ChildSpec, Restart, RestartIntensity, SupervisorBuilder,
-    SupervisorError,
+    BackoffPolicy, ChildSpec, Restart, RestartIntensity, SupervisorBuilder, SupervisorError,
 };
 
 mod common;
@@ -16,10 +15,8 @@ async fn repeated_failures_can_exceed_restart_intensity() {
             backoff: BackoffPolicy::None,
         })
         .child(
-            ChildSpec::new("flaky", |_| async {
-                ChildResult::Failed(common::test_error("boom"))
-            })
-            .restart(Restart::Transient),
+            ChildSpec::new("flaky", |_| async { Err(common::test_error("boom")) })
+                .restart(Restart::Transient),
         )
         .build()
         .expect("valid supervisor");
@@ -41,10 +38,8 @@ async fn configured_backoff_delays_restart_attempts() {
             backoff: BackoffPolicy::Fixed(Duration::from_millis(75)),
         })
         .child(
-            ChildSpec::new("flaky", |_| async {
-                ChildResult::Failed(common::test_error("boom"))
-            })
-            .restart(Restart::Transient),
+            ChildSpec::new("flaky", |_| async { Err(common::test_error("boom")) })
+                .restart(Restart::Transient),
         )
         .build()
         .expect("valid supervisor");

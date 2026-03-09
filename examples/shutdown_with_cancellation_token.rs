@@ -1,5 +1,5 @@
 use tokio::time::{Duration, sleep};
-use tokio_supervisor::{ChildResult, ChildSpec, SupervisorBuilder, SupervisorExit};
+use tokio_supervisor::{ChildSpec, SupervisorBuilder, SupervisorExit};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::select! {
                     _ = ctx.token.cancelled() => {
                         println!("http-server received cancellation");
-                        return ChildResult::Completed;
+                        return Ok(());
                     }
                     _ = sleep(Duration::from_millis(75)) => {
                         println!("http-server heartbeat");

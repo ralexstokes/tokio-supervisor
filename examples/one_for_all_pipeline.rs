@@ -10,9 +10,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, sleep, timeout},
 };
-use tokio_supervisor::{
-    BoxError, ChildResult, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit,
-};
+use tokio_supervisor::{BoxError, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit};
 
 fn example_error(message: &'static str) -> BoxError {
     Box::new(std::io::Error::other(message))
@@ -35,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 loop {
                     tokio::select! {
-                        _ = ctx.token.cancelled() => return ChildResult::Completed,
+                        _ = ctx.token.cancelled() => return Ok(()),
                         _ = sleep(Duration::from_millis(50)) => {}
                     }
                 }
@@ -59,12 +57,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if decode_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                     sleep(Duration::from_millis(100)).await;
                     println!("decode failed in generation {}", ctx.generation);
-                    return ChildResult::Failed(example_error("corrupt frame"));
+                    return Err(example_error("corrupt frame"));
                 }
 
                 loop {
                     tokio::select! {
-                        _ = ctx.token.cancelled() => return ChildResult::Completed,
+                        _ = ctx.token.cancelled() => return Ok(()),
                         _ = sleep(Duration::from_millis(50)) => {}
                     }
                 }
@@ -85,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 loop {
                     tokio::select! {
-                        _ = ctx.token.cancelled() => return ChildResult::Completed,
+                        _ = ctx.token.cancelled() => return Ok(()),
                         _ = sleep(Duration::from_millis(50)) => {}
                     }
                 }
