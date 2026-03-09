@@ -23,3 +23,5 @@ target
 .direnv/
 .env
 result
+
+.claude/
