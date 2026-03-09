@@ -4,11 +4,12 @@ use std::sync::{
 };
 
 use tokio::{
-    sync::mpsc,
-    time::{Duration, sleep},
+    sync::{broadcast, mpsc},
+    time::{Duration, sleep, timeout},
 };
 use tokio_supervisor::{
-    ChildResult, ChildSpec, ShutdownMode, ShutdownPolicy, SupervisorBuilder, SupervisorExit,
+    BackoffPolicy, ChildResult, ChildSpec, Restart, RestartIntensity, ShutdownMode, ShutdownPolicy,
+    SupervisorBuilder, SupervisorEvent, SupervisorExit,
 };
 
 mod common;
@@ -176,4 +177,72 @@ async fn wait_only_resolves_after_child_lifetimes_end() {
         !live_flag.is_live(),
         "child must be dropped before wait completes"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_preempts_zero_delay_restart() {
+    let supervisor = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 8,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::None,
+        })
+        .child(
+            ChildSpec::new("flaky", |_ctx| async move {
+                ChildResult::Failed(common::test_error("restart immediately"))
+            })
+            .restart(Restart::Transient),
+        )
+        .build()
+        .expect("valid supervisor");
+
+    let handle = supervisor.spawn();
+    let mut events = handle.subscribe();
+
+    loop {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::ChildRestartScheduled { delay, .. } => {
+                assert!(delay.is_zero(), "test requires zero-delay restart");
+                handle.shutdown();
+                break;
+            }
+            SupervisorEvent::RestartIntensityExceeded => {
+                panic!("shutdown lost to zero-delay restart");
+            }
+            _ => {}
+        }
+    }
+
+    loop {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::SupervisorStopping => break,
+            SupervisorEvent::ChildRestarted { .. } => {
+                panic!("child restarted after shutdown was requested");
+            }
+            SupervisorEvent::RestartIntensityExceeded => {
+                panic!("shutdown lost to zero-delay restart");
+            }
+            _ => {}
+        }
+    }
+
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+async fn recv_supervisor_event(
+    events: &mut broadcast::Receiver<SupervisorEvent>,
+) -> SupervisorEvent {
+    match timeout(common::EVENT_TIMEOUT, events.recv())
+        .await
+        .expect("timed out waiting for supervisor event")
+    {
+        Ok(event) => event,
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            panic!("lagged while reading supervisor events: skipped {skipped}");
+        }
+        Err(broadcast::error::RecvError::Closed) => {
+            panic!("supervisor event stream closed unexpectedly");
+        }
+    }
 }

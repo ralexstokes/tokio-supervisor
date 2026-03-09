@@ -103,6 +103,7 @@ impl SupervisorRuntime {
             }
 
             tokio::select! {
+                biased;
                 changed = self.shutdown_rx.changed() => {
                     match changed {
                         Ok(()) if *self.shutdown_rx.borrow() => return self.shutdown_all().await,
@@ -316,16 +317,8 @@ impl SupervisorRuntime {
     }
 
     async fn wait_for_restart_delay(&mut self, delay: Duration) -> Result<bool, SupervisorError> {
-        if delay.is_zero() {
-            if *self.shutdown_rx.borrow() {
-                let _ = self.shutdown_all().await?;
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-
         tokio::select! {
-            _ = tokio::time::sleep(delay) => Ok(true),
+            biased;
             changed = self.shutdown_rx.changed() => {
                 match changed {
                     Ok(()) if *self.shutdown_rx.borrow() => {
@@ -341,6 +334,7 @@ impl SupervisorRuntime {
                     }
                 }
             }
+            _ = tokio::time::sleep(delay) => Ok(true),
         }
     }
 

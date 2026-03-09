@@ -1,5 +1,3 @@
-* [] v0.1 SPEC gaps
-  - fix the shutdown-vs-zero-delay-restart race so shutdown consistently returns `SupervisorExit::Shutdown`
 * [] tracing, metrics, observability
 * [] hardening
 * [] required vs optional children
