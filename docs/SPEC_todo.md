@@ -21,14 +21,10 @@ The core runtime is implemented and tested, but there is still room for targeted
 * broader event-surface verification
 * general race and failure-path hardening
 
-## Feature backlog
-
-The remaining feature backlog is:
+## Out of scope
 
 * readiness protocol
 * health probes
-
-## Out of scope
 
 * required vs optional children
 * distributed supervision
