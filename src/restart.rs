@@ -67,15 +67,25 @@ pub struct RestartIntensity {
 
 impl Default for RestartIntensity {
     fn default() -> Self {
-        Self {
-            max_restarts: 5,
-            within: Duration::from_secs(30),
-            backoff: BackoffPolicy::None,
-        }
+        Self::new(5, Duration::from_secs(30))
     }
 }
 
 impl RestartIntensity {
+    pub fn new(max_restarts: usize, within: Duration) -> Self {
+        Self {
+            max_restarts,
+            within,
+            backoff: BackoffPolicy::None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_backoff(mut self, backoff: BackoffPolicy) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<(), BuildError> {
         require_non_zero_duration(self.within, "restart intensity window must be non-zero")?;
         self.backoff.validate()

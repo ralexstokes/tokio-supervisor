@@ -67,6 +67,7 @@ mod error;
 mod event;
 mod handle;
 mod observability;
+pub mod prelude;
 mod restart;
 mod runtime;
 mod shutdown;

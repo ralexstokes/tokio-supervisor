@@ -13,11 +13,26 @@ pub struct ShutdownPolicy {
     pub mode: ShutdownMode,
 }
 
+impl ShutdownPolicy {
+    pub fn new(grace: Duration, mode: ShutdownMode) -> Self {
+        Self { grace, mode }
+    }
+
+    pub fn cooperative(grace: Duration) -> Self {
+        Self::new(grace, ShutdownMode::Cooperative)
+    }
+
+    pub fn cooperative_then_abort(grace: Duration) -> Self {
+        Self::new(grace, ShutdownMode::CooperativeThenAbort)
+    }
+
+    pub fn abort() -> Self {
+        Self::new(Duration::ZERO, ShutdownMode::Abort)
+    }
+}
+
 impl Default for ShutdownPolicy {
     fn default() -> Self {
-        Self {
-            grace: Duration::from_secs(5),
-            mode: ShutdownMode::CooperativeThenAbort,
-        }
+        Self::cooperative_then_abort(Duration::from_secs(5))
     }
 }

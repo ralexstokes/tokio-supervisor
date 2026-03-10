@@ -190,6 +190,11 @@ impl SupervisorHandle {
         let _ = self.shutdown_tx.send(true);
     }
 
+    pub async fn shutdown_and_wait(&self) -> Result<SupervisorExit, SupervisorError> {
+        self.shutdown();
+        self.wait().await
+    }
+
     pub async fn add_child(&self, child: ChildSpec) -> Result<(), ControlError> {
         self.control_endpoint().add_child(child).await
     }

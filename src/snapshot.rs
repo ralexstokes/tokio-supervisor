@@ -24,6 +24,41 @@ pub struct ChildSnapshot {
     pub supervisor: Option<Box<SupervisorSnapshot>>,
 }
 
+impl SupervisorSnapshot {
+    pub fn child(&self, id: &str) -> Option<&ChildSnapshot> {
+        self.children.iter().find(|child| child.id == id)
+    }
+
+    pub fn descendant<I, S>(&self, path: I) -> Option<&ChildSnapshot>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut path = path.into_iter();
+        let mut child = self.child(path.next()?.as_ref())?;
+
+        for segment in path {
+            child = child.child(segment.as_ref())?;
+        }
+
+        Some(child)
+    }
+}
+
+impl ChildSnapshot {
+    pub fn child(&self, id: &str) -> Option<&ChildSnapshot> {
+        self.supervisor.as_deref()?.child(id)
+    }
+
+    pub fn descendant<I, S>(&self, path: I) -> Option<&ChildSnapshot>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.supervisor.as_deref()?.descendant(path)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupervisorStateView {
     Running,
