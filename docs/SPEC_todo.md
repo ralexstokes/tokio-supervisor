@@ -4,14 +4,6 @@ This document carries forward the parts of the old handoff `SPEC.md` that are
 not yet reflected by the codebase at commit
 `2fe64feff2d853c570569f899474844740e7077b`.
 
-## Observability
-
-The crate already exposes `SupervisorEvent` and has light internal tracing, but broader observability is still open:
-
-* richer tracing spans and logs across the supervision lifecycle
-* metrics for restarts, shutdowns, failures, and running children
-* clearer observability guidance and examples beyond the basic event subscriber example
-
 ## Hardening and coverage
 
 The core runtime is implemented and tested, but there is still room for targeted hardening:

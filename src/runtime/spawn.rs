@@ -9,6 +9,7 @@ use crate::{
     },
     snapshot::{NestedSnapshotForwarder, with_nested_snapshot_forwarder},
 };
+use tracing::{Instrument, info_span};
 
 impl SupervisorRuntime {
     pub(crate) fn spawn_child(
@@ -57,21 +58,35 @@ impl SupervisorRuntime {
             generation,
         );
         let control_scope = NestedControlScope::new(self.registry.clone(), self.child_path(key));
+        let child_path = self.observability.child_path(&child_id);
+        let supervisor_name = self.observability.supervisor_name().to_owned();
+        let supervisor_path = self.observability.supervisor_path().to_owned();
+        let child_span = info_span!(
+            "child",
+            supervisor_name = %supervisor_name,
+            supervisor_path = %supervisor_path,
+            child_id = %child_id,
+            child_path = %child_path,
+            generation,
+        );
 
-        let abort_handle = self.join_set.spawn(async move {
-            let result = with_nested_control_scope(control_scope, async move {
-                with_nested_snapshot_forwarder(snapshot_forwarder, async move {
-                    with_nested_event_forwarder(forwarder, future).await
+        let abort_handle = self.join_set.spawn(
+            async move {
+                let result = with_nested_control_scope(control_scope, async move {
+                    with_nested_snapshot_forwarder(snapshot_forwarder, async move {
+                        with_nested_event_forwarder(forwarder, future).await
+                    })
+                    .await
                 })
-                .await
-            })
-            .await;
-            ChildEnvelope {
-                key,
-                generation,
-                result,
+                .await;
+                ChildEnvelope {
+                    key,
+                    generation,
+                    result,
+                }
             }
-        });
+            .instrument(child_span),
+        );
         let task_id = abort_handle.id();
 
         let entry = self.children.get_mut(key).ok_or_else(|| {

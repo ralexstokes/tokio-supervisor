@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant as StdInstant},
+};
 
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -12,6 +16,7 @@ use crate::{
     error::{ControlError, SupervisorError, SupervisorExit},
     event::{ExitStatusView, SupervisorEvent},
     handle::{NestedControlRegistry, SupervisorCommand},
+    observability::SupervisorObservability,
     restart::{Restart, RestartIntensity},
     snapshot::{
         ChildMembershipView, ChildSnapshot, ChildStateView, NestedSnapshotUpdate,
@@ -100,6 +105,7 @@ pub(crate) struct SupervisorRuntime {
     pub(crate) task_map: HashMap<Id, TaskMeta>,
     pub(crate) pending_exit: Option<Result<SupervisorExit, SupervisorError>>,
     pub(crate) last_exit: Option<SupervisorExit>,
+    pub(crate) observability: SupervisorObservability,
 }
 
 impl SupervisorRuntime {
@@ -113,6 +119,7 @@ impl SupervisorRuntime {
         path_prefix: Vec<String>,
     ) -> Self {
         let default_restart_intensity = config.restart_intensity;
+        let observability = SupervisorObservability::new(path_prefix.clone(), config.strategy);
         let mut children = Vec::with_capacity(config.children.len());
         let mut children_by_id = HashMap::with_capacity(config.children.len());
 
@@ -143,6 +150,7 @@ impl SupervisorRuntime {
             task_map: HashMap::new(),
             pending_exit: None,
             last_exit: None,
+            observability,
         }
     }
 
@@ -344,11 +352,17 @@ impl SupervisorRuntime {
         let child_id = self.child_id(key).ok_or_else(|| {
             ControlError::Internal("missing child id while removing child".to_owned())
         })?;
+        let started_at = StdInstant::now();
         let mut deadline = deadline;
         let mut removal_error = None;
 
         loop {
             if self.children[key].membership == MembershipState::Removed {
+                self.observability.record_shutdown_duration(
+                    "remove_child",
+                    started_at.elapsed(),
+                    Some(&child_id),
+                );
                 return removal_error.map_or(Ok(()), Err);
             }
 
@@ -363,6 +377,8 @@ impl SupervisorRuntime {
                     }
                     _ = tokio::time::sleep_until(deadline_at) => {
                         self.abort_child(key);
+                        self.observability
+                            .record_shutdown_timeout("remove_child", Some(&child_id));
                         if timeout_is_error {
                             removal_error = Some(ControlError::ShutdownTimedOut(child_id.clone()));
                         }
@@ -683,6 +699,19 @@ impl SupervisorRuntime {
         })
     }
 
+    fn running_child_count(&self) -> usize {
+        self.children
+            .iter()
+            .filter(|entry| {
+                entry.membership != MembershipState::Removed
+                    && matches!(
+                        entry.runtime.state,
+                        RuntimeChildState::Starting | RuntimeChildState::Running
+                    )
+            })
+            .count()
+    }
+
     fn send_restart_event(&self, key: ChildKey, old_generation: u64, new_generation: u64) {
         self.send_event(SupervisorEvent::ChildRestarted {
             id: self.children[key].id.clone(),
@@ -693,6 +722,8 @@ impl SupervisorRuntime {
 
     pub(crate) fn send_event(&self, event: SupervisorEvent) {
         self.publish_snapshot();
+        self.observability
+            .emit_event(&event, self.running_child_count());
         let _ = self.events.send(event);
     }
 

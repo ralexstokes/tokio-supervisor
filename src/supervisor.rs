@@ -1,6 +1,7 @@
 use std::{io::Error, sync::Arc};
 
 use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{Instrument, info_span};
 
 use crate::{
     child::{ChildResult, ChildSpec, ChildSpecInner},
@@ -10,6 +11,9 @@ use crate::{
     handle::{
         NestedControlRegistry, NestedControlScope, SupervisorCommand, SupervisorHandle,
         SupervisorHandleInit, current_nested_control_scope,
+    },
+    observability::{
+        SupervisorObservability, format_path, strategy_label, supervisor_name_for_path,
     },
     restart::RestartIntensity,
     runtime::SupervisorRuntime,
@@ -120,6 +124,9 @@ impl Supervisor {
         registry: Arc<NestedControlRegistry>,
         path_prefix: Vec<String>,
     ) -> Result<SupervisorExit, SupervisorError> {
+        let supervisor_name = supervisor_name_for_path(&path_prefix).to_owned();
+        let supervisor_path = format_path(&path_prefix);
+        let strategy = strategy_label(self.config.strategy);
         let mut runtime = SupervisorRuntime::new(
             self.config,
             shutdown_rx,
@@ -129,7 +136,15 @@ impl Supervisor {
             registry,
             path_prefix,
         );
-        runtime.run().await
+        runtime
+            .run()
+            .instrument(info_span!(
+                "supervisor",
+                supervisor_name = %supervisor_name,
+                supervisor_path = %supervisor_path,
+                strategy,
+            ))
+            .await
     }
 
     async fn run_as_child(self, ctx: ChildContext) -> ChildResult {
@@ -144,7 +159,10 @@ impl Supervisor {
         let _registration = control_scope.register(handle.control_endpoint());
         let mut events_rx = handle.subscribe();
         let mut snapshots_rx = handle.subscribe_snapshots();
-        forward_nested_snapshot(handle.snapshot());
+        let initial_snapshot = handle.snapshot();
+        let observability =
+            SupervisorObservability::new(control_scope.child_path(), initial_snapshot.strategy);
+        forward_nested_snapshot(initial_snapshot);
         let wait = handle.wait();
         tokio::pin!(wait);
         let mut shutdown_requested = false;
@@ -165,7 +183,9 @@ impl Supervisor {
                 maybe_event = events_rx.recv() => {
                     match maybe_event {
                         Ok(event) => forward_nested_event(event),
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            observability.emit_nested_event_forwarding_lag(dropped);
+                        }
                         Err(broadcast::error::RecvError::Closed) => {}
                     }
                 }

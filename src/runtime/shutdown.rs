@@ -1,4 +1,7 @@
+use std::time::Instant as StdInstant;
+
 use tokio::time::{Instant, sleep_until};
+use tracing::{Instrument, info_span};
 
 use crate::{
     error::{SupervisorError, SupervisorExit},
@@ -14,12 +17,22 @@ use super::supervision::SupervisorRuntime;
 
 impl SupervisorRuntime {
     pub(crate) async fn shutdown_all(&mut self) -> Result<SupervisorExit, SupervisorError> {
-        self.state = SupervisorState::Stopping;
-        self.cancel_running_children();
-        self.send_event(SupervisorEvent::SupervisorStopping);
-        self.drain_children(DrainReason::Shutdown).await?;
-        self.finish_with_exit(SupervisorExit::Shutdown);
-        Ok(SupervisorExit::Shutdown)
+        let span = info_span!(
+            "shutdown",
+            supervisor_name = %self.observability.supervisor_name(),
+            supervisor_path = %self.observability.supervisor_path(),
+        );
+
+        async {
+            self.state = SupervisorState::Stopping;
+            self.cancel_running_children();
+            self.send_event(SupervisorEvent::SupervisorStopping);
+            self.drain_children(DrainReason::Shutdown).await?;
+            self.finish_with_exit(SupervisorExit::Shutdown);
+            Ok(SupervisorExit::Shutdown)
+        }
+        .instrument(span)
+        .await
     }
 
     pub(crate) async fn drain_for_group_restart(&mut self) -> Result<(), SupervisorError> {
@@ -45,6 +58,7 @@ impl SupervisorRuntime {
     }
 
     async fn drain_children(&mut self, reason: DrainReason) -> Result<(), SupervisorError> {
+        let started_at = StdInstant::now();
         let mut max_grace: Option<std::time::Duration> = None;
 
         for child in &self.children {
@@ -84,6 +98,10 @@ impl SupervisorRuntime {
                     }
                 }
             }
+
+            if !self.join_set.is_empty() && matches!(reason, DrainReason::Shutdown) {
+                self.observability.record_shutdown_timeout("shutdown", None);
+            }
         }
 
         let timed_out = cooperative_timeout_names(&self.children);
@@ -98,6 +116,11 @@ impl SupervisorRuntime {
                 )
             });
             self.drain_join_set(reason).await?;
+            self.observability.record_shutdown_duration(
+                shutdown_operation(reason),
+                started_at.elapsed(),
+                None,
+            );
             return Err(SupervisorError::ShutdownTimedOut(timed_out));
         }
 
@@ -107,7 +130,13 @@ impl SupervisorRuntime {
                 ShutdownMode::CooperativeThenAbort | ShutdownMode::Abort
             )
         });
-        self.drain_join_set(reason).await
+        let result = self.drain_join_set(reason).await;
+        self.observability.record_shutdown_duration(
+            shutdown_operation(reason),
+            started_at.elapsed(),
+            None,
+        );
+        result
     }
 
     async fn drain_join_set(&mut self, reason: DrainReason) -> Result<(), SupervisorError> {
@@ -144,4 +173,11 @@ fn cooperative_timeout_names(children: &[ChildEntry]) -> String {
         .map(|child| child.id.as_str())
         .collect();
     ids.join(", ")
+}
+
+fn shutdown_operation(reason: DrainReason) -> &'static str {
+    match reason {
+        DrainReason::Shutdown => "shutdown",
+        DrainReason::GroupRestart => "group_restart",
+    }
 }
