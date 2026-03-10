@@ -1,6 +1,7 @@
 # tokio-supervisor
 
-Erlang/OTP-style supervisor trees in the tokio ecosystem
+Structured task supervision for tokio.
+Inspired by Erlang/OTP-style supervisor trees.
 
 ## Development
 
