@@ -37,6 +37,27 @@ pub enum BackoffPolicy {
     },
 }
 
+impl BackoffPolicy {
+    fn validate(self) -> Result<(), BuildError> {
+        match self {
+            Self::None => Ok(()),
+            Self::Fixed(delay) => {
+                require_non_zero_duration(delay, "fixed backoff delay must be non-zero")
+            }
+            Self::Exponential { base, factor, max }
+            | Self::JitteredExponential { base, factor, max } => {
+                require_non_zero_duration(base, "exponential backoff base must be non-zero")?;
+                if factor == 0 {
+                    return Err(BuildError::InvalidConfig(
+                        "exponential backoff factor must be non-zero",
+                    ));
+                }
+                require_non_zero_duration(max, "exponential backoff max must be non-zero")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RestartIntensity {
     pub max_restarts: usize,
@@ -56,41 +77,15 @@ impl Default for RestartIntensity {
 
 impl RestartIntensity {
     pub(crate) fn validate(&self) -> Result<(), BuildError> {
-        if self.within.is_zero() {
-            return Err(BuildError::InvalidConfig(
-                "restart intensity window must be non-zero",
-            ));
-        }
-
-        match self.backoff {
-            BackoffPolicy::None => {}
-            BackoffPolicy::Fixed(delay) => {
-                if delay.is_zero() {
-                    return Err(BuildError::InvalidConfig(
-                        "fixed backoff delay must be non-zero",
-                    ));
-                }
-            }
-            BackoffPolicy::Exponential { base, factor, max }
-            | BackoffPolicy::JitteredExponential { base, factor, max } => {
-                if base.is_zero() {
-                    return Err(BuildError::InvalidConfig(
-                        "exponential backoff base must be non-zero",
-                    ));
-                }
-                if factor == 0 {
-                    return Err(BuildError::InvalidConfig(
-                        "exponential backoff factor must be non-zero",
-                    ));
-                }
-                if max.is_zero() {
-                    return Err(BuildError::InvalidConfig(
-                        "exponential backoff max must be non-zero",
-                    ));
-                }
-            }
-        }
-
-        Ok(())
+        require_non_zero_duration(self.within, "restart intensity window must be non-zero")?;
+        self.backoff.validate()
     }
+}
+
+fn require_non_zero_duration(duration: Duration, message: &'static str) -> Result<(), BuildError> {
+    if duration.is_zero() {
+        return Err(BuildError::InvalidConfig(message));
+    }
+
+    Ok(())
 }

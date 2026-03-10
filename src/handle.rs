@@ -199,12 +199,11 @@ impl SupervisorHandle {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let path = collect_path(path);
-        if path.is_empty() {
-            return self.add_child(child).await;
+        if let Some(endpoint) = self.endpoint_for_relative_path(path)? {
+            endpoint.add_child(child).await
+        } else {
+            self.add_child(child).await
         }
-
-        self.endpoint_for_path(&path)?.add_child(child).await
     }
 
     pub async fn remove_child(&self, id: impl Into<String>) -> Result<(), ControlError> {
@@ -220,12 +219,11 @@ impl SupervisorHandle {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let path = collect_path(path);
-        if path.is_empty() {
-            return self.remove_child(id).await;
+        if let Some(endpoint) = self.endpoint_for_relative_path(path)? {
+            endpoint.remove_child(id.into()).await
+        } else {
+            self.remove_child(id).await
         }
-
-        self.endpoint_for_path(&path)?.remove_child(id.into()).await
     }
 
     pub async fn wait(&self) -> Result<SupervisorExit, SupervisorError> {
@@ -280,6 +278,22 @@ impl SupervisorHandle {
     pub(crate) fn control_endpoint(&self) -> ControlEndpoint {
         ControlEndpoint {
             command_tx: self.command_tx.clone(),
+        }
+    }
+
+    fn endpoint_for_relative_path<I, S>(
+        &self,
+        path: I,
+    ) -> Result<Option<ControlEndpoint>, ControlError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let path = collect_path(path);
+        if path.is_empty() {
+            Ok(None)
+        } else {
+            self.endpoint_for_path(&path).map(Some)
         }
     }
 

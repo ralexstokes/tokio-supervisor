@@ -188,10 +188,8 @@ impl SupervisorRuntime {
             tokio::select! {
                 biased;
                 changed = self.shutdown_rx.changed() => {
-                    match changed {
-                        Ok(()) if *self.shutdown_rx.borrow() => return self.shutdown_all().await,
-                        Ok(()) => {}
-                        Err(_) => return self.shutdown_all().await,
+                    if self.shutdown_requested(changed) {
+                        return self.shutdown_all().await;
                     }
                 }
                 command = self.command_rx.recv(), if self.commands_open => {
@@ -429,18 +427,11 @@ impl SupervisorRuntime {
         &mut self,
         changed: Result<(), tokio::sync::watch::error::RecvError>,
     ) -> Result<(), ControlError> {
-        match changed {
-            Ok(()) if *self.shutdown_rx.borrow() => {
-                let result = self.shutdown_all().await;
-                self.pending_exit = Some(result);
-                Err(ControlError::SupervisorStopping)
-            }
-            Ok(()) => Ok(()),
-            Err(_) => {
-                let result = self.shutdown_all().await;
-                self.pending_exit = Some(result);
-                Err(ControlError::SupervisorStopping)
-            }
+        if self.shutdown_requested(changed) {
+            self.queue_shutdown_exit().await;
+            Err(ControlError::SupervisorStopping)
+        } else {
+            Ok(())
         }
     }
 
@@ -478,6 +469,20 @@ impl SupervisorRuntime {
 
     fn active_child_count(&self) -> usize {
         self.children_by_id.len()
+    }
+
+    fn shutdown_requested(
+        &self,
+        changed: Result<(), tokio::sync::watch::error::RecvError>,
+    ) -> bool {
+        match changed {
+            Ok(()) => *self.shutdown_rx.borrow(),
+            Err(_) => true,
+        }
+    }
+
+    async fn queue_shutdown_exit(&mut self) {
+        self.pending_exit = Some(self.shutdown_all().await);
     }
 
     fn child_id(&self, key: ChildKey) -> Option<String> {
@@ -704,18 +709,9 @@ impl SupervisorRuntime {
             tokio::select! {
                 biased;
                 changed = self.shutdown_rx.changed() => {
-                    match changed {
-                        Ok(()) if *self.shutdown_rx.borrow() => {
-                            let result = self.shutdown_all().await;
-                            self.pending_exit = Some(result);
-                            return Ok(false);
-                        }
-                        Ok(()) => {}
-                        Err(_) => {
-                            let result = self.shutdown_all().await;
-                            self.pending_exit = Some(result);
-                            return Ok(false);
-                        }
+                    if self.shutdown_requested(changed) {
+                        self.queue_shutdown_exit().await;
+                        return Ok(false);
                     }
                 }
                 command = self.command_rx.recv(), if self.commands_open => {

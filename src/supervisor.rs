@@ -156,13 +156,13 @@ impl Supervisor {
                 vec![child_id.clone()],
             )
         });
-        let handle = self.spawn_with_control(control_scope.registry(), control_scope.child_path());
+        let child_path = control_scope.child_path();
+        let handle = self.spawn_with_control(control_scope.registry(), child_path.clone());
         let _registration = control_scope.register(handle.control_endpoint());
         let mut events_rx = handle.subscribe();
         let mut snapshots_rx = handle.subscribe_snapshots();
         let initial_snapshot = handle.snapshot();
-        let observability =
-            SupervisorObservability::new(control_scope.child_path(), initial_snapshot.strategy);
+        let observability = SupervisorObservability::new(child_path, initial_snapshot.strategy);
         forward_nested_snapshot(initial_snapshot);
         let wait = handle.wait();
         tokio::pin!(wait);
@@ -173,27 +173,13 @@ impl Supervisor {
                 biased;
                 result = &mut wait => {
                     drain_nested_events(&mut events_rx);
-                    return match result {
-                        Ok(SupervisorExit::Completed | SupervisorExit::Shutdown) => Ok(()),
-                        Ok(SupervisorExit::Failed) => Err(Box::new(Error::other(format!(
-                            "nested supervisor `{child_id}` failed"
-                        )))),
-                        Err(err) => Err(Box::new(err)),
-                    };
+                    return map_nested_supervisor_result(&child_id, result);
                 }
                 maybe_event = events_rx.recv() => {
-                    match maybe_event {
-                        Ok(event) => forward_nested_event(event),
-                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                            observability.emit_nested_event_forwarding_lag(dropped);
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {}
-                    }
+                    handle_nested_event(&observability, maybe_event);
                 }
                 changed = snapshots_rx.changed() => {
-                    if let Ok(()) = changed {
-                        forward_nested_snapshot(snapshots_rx.borrow().clone());
-                    }
+                    forward_nested_snapshot_change(&snapshots_rx, changed);
                 }
                 _ = ctx.token.cancelled(), if !shutdown_requested => {
                     shutdown_requested = true;
@@ -207,6 +193,41 @@ impl Supervisor {
 impl std::fmt::Debug for Supervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Supervisor").finish_non_exhaustive()
+    }
+}
+
+fn map_nested_supervisor_result(
+    child_id: &str,
+    result: Result<SupervisorExit, SupervisorError>,
+) -> ChildResult {
+    match result {
+        Ok(SupervisorExit::Completed | SupervisorExit::Shutdown) => Ok(()),
+        Ok(SupervisorExit::Failed) => Err(Box::new(Error::other(format!(
+            "nested supervisor `{child_id}` failed"
+        )))),
+        Err(err) => Err(Box::new(err)),
+    }
+}
+
+fn handle_nested_event(
+    observability: &SupervisorObservability,
+    maybe_event: Result<crate::event::SupervisorEvent, broadcast::error::RecvError>,
+) {
+    match maybe_event {
+        Ok(event) => forward_nested_event(event),
+        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+            observability.emit_nested_event_forwarding_lag(dropped);
+        }
+        Err(broadcast::error::RecvError::Closed) => {}
+    }
+}
+
+fn forward_nested_snapshot_change(
+    snapshots_rx: &watch::Receiver<SupervisorSnapshot>,
+    changed: Result<(), watch::error::RecvError>,
+) {
+    if changed.is_ok() {
+        forward_nested_snapshot(snapshots_rx.borrow().clone());
     }
 }
 

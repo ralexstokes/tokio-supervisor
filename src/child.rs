@@ -53,6 +53,12 @@ where
 }
 
 impl ChildSpec {
+    fn map_inner(mut self, update: impl FnOnce(&mut ChildSpecInner)) -> Self {
+        let inner = Arc::make_mut(&mut self.inner);
+        update(inner);
+        self
+    }
+
     pub fn new<F, Fut>(id: impl Into<String>, f: F) -> Self
     where
         F: Fn(ChildContext) -> Fut + Send + Sync + 'static,
@@ -71,29 +77,17 @@ impl ChildSpec {
 
     #[must_use]
     pub fn restart(self, restart: Restart) -> Self {
-        let mut inner = Arc::unwrap_or_clone(self.inner);
-        inner.restart = restart;
-        Self {
-            inner: Arc::new(inner),
-        }
+        self.map_inner(|inner| inner.restart = restart)
     }
 
     #[must_use]
     pub fn shutdown(self, policy: ShutdownPolicy) -> Self {
-        let mut inner = Arc::unwrap_or_clone(self.inner);
-        inner.shutdown_policy = policy;
-        Self {
-            inner: Arc::new(inner),
-        }
+        self.map_inner(|inner| inner.shutdown_policy = policy)
     }
 
     #[must_use]
     pub fn restart_intensity(self, intensity: RestartIntensity) -> Self {
-        let mut inner = Arc::unwrap_or_clone(self.inner);
-        inner.restart_intensity = Some(intensity);
-        Self {
-            inner: Arc::new(inner),
-        }
+        self.map_inner(|inner| inner.restart_intensity = Some(intensity))
     }
 
     pub fn id(&self) -> &str {
