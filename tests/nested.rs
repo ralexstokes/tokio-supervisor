@@ -8,8 +8,8 @@ use tokio::{
     time::timeout,
 };
 use tokio_supervisor::{
-    ChildSpec, EventPathSegment, ExitStatusView, Restart, SupervisorBuilder, SupervisorEvent,
-    SupervisorExit,
+    ChildSpec, ControlError, EventPathSegment, ExitStatusView, Restart, SupervisorBuilder,
+    SupervisorEvent, SupervisorExit,
 };
 
 mod common;
@@ -439,6 +439,65 @@ async fn nested_events_preserve_the_full_tree_path() {
             break;
         }
     }
+}
+
+#[tokio::test]
+async fn removing_nested_supervisor_unregisters_its_control_endpoint() {
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+
+    let nested = SupervisorBuilder::new()
+        .child(ChildSpec::new("leaf", move |ctx| {
+            let started_tx = started_tx.clone();
+            async move {
+                started_tx.send(()).expect("test receiver dropped");
+                ctx.token.cancelled().await;
+                Ok(())
+            }
+        }))
+        .build()
+        .expect("valid nested supervisor");
+
+    let handle = SupervisorBuilder::new()
+        .child(ChildSpec::new("anchor", |ctx| async move {
+            ctx.token.cancelled().await;
+            Ok(())
+        }))
+        .build()
+        .expect("valid outer supervisor")
+        .spawn();
+
+    handle
+        .add_child(nested.into_child_spec("nested"))
+        .await
+        .expect("nested child should be accepted");
+    common::recv_event(&mut started_rx).await;
+
+    handle
+        .remove_child("nested")
+        .await
+        .expect("nested child should be removable");
+
+    let add_err = handle
+        .add_child_at(
+            ["nested"],
+            ChildSpec::new("late", |_ctx| async move { Ok(()) }),
+        )
+        .await
+        .expect_err("removed nested supervisor should no longer accept child commands");
+    assert_eq!(add_err, ControlError::UnknownChildId("nested".to_owned()));
+
+    let remove_err = handle
+        .remove_child_at(["nested"], "late")
+        .await
+        .expect_err("removed nested supervisor should no longer accept remove commands");
+    assert_eq!(
+        remove_err,
+        ControlError::UnknownChildId("nested".to_owned())
+    );
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
 }
 
 async fn recv_supervisor_event(

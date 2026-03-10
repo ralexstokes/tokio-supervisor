@@ -4,12 +4,12 @@ use std::sync::{
 };
 
 use tokio::{
-    sync::mpsc,
+    sync::{broadcast, mpsc},
     time::{Duration, sleep, timeout},
 };
 use tokio_supervisor::{
     BackoffPolicy, ChildSpec, Restart, RestartIntensity, Strategy, SupervisorBuilder,
-    SupervisorExit,
+    SupervisorEvent, SupervisorExit,
 };
 
 mod common;
@@ -220,4 +220,95 @@ async fn child_restart_intensity_is_isolated_per_child() {
     handle.shutdown();
     let exit = handle.wait().await.expect("shutdown should succeed");
     assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+#[tokio::test]
+async fn restart_events_follow_exit_schedule_start_restart_order() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let handle = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 2,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::Fixed(Duration::from_millis(40)),
+        })
+        .child(
+            ChildSpec::new("flaky", move |ctx| {
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(common::test_error("boom"))
+                    } else {
+                        ctx.token.cancelled().await;
+                        Ok(())
+                    }
+                }
+            })
+            .restart(Restart::Transient),
+        )
+        .build()
+        .expect("valid supervisor")
+        .spawn();
+    let mut events = handle.subscribe();
+
+    let mut sequence = Vec::new();
+    let mut saw_restart = false;
+
+    while !saw_restart {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::ChildExited { id, generation, .. }
+                if id == "flaky" && generation == 0 =>
+            {
+                sequence.push("exited");
+            }
+            SupervisorEvent::ChildRestartScheduled {
+                id,
+                generation,
+                delay,
+            } if id == "flaky" && generation == 0 => {
+                assert_eq!(delay, Duration::from_millis(40));
+                sequence.push("scheduled");
+            }
+            SupervisorEvent::ChildStarted { id, generation }
+                if id == "flaky" && generation == 1 =>
+            {
+                sequence.push("started");
+            }
+            SupervisorEvent::ChildRestarted {
+                id,
+                old_generation,
+                new_generation,
+            } if id == "flaky" && old_generation == 0 && new_generation == 1 => {
+                saw_restart = true;
+                sequence.push("restarted");
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        sequence,
+        vec!["exited", "scheduled", "started", "restarted"]
+    );
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+async fn recv_supervisor_event(
+    events: &mut broadcast::Receiver<SupervisorEvent>,
+) -> SupervisorEvent {
+    match timeout(common::EVENT_TIMEOUT, events.recv())
+        .await
+        .expect("timed out waiting for supervisor event")
+    {
+        Ok(event) => event,
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            panic!("lagged while reading supervisor events: skipped {skipped}");
+        }
+        Err(broadcast::error::RecvError::Closed) => {
+            panic!("supervisor event stream closed unexpectedly");
+        }
+    }
 }

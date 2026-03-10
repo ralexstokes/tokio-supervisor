@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{Notify, mpsc};
+use tokio::{
+    sync::{Notify, mpsc},
+    time::sleep,
+};
 use tokio_supervisor::{
     BackoffPolicy, ChildSpec, Restart, RestartIntensity, SupervisorBuilder, SupervisorError,
     SupervisorExit,
@@ -95,6 +98,59 @@ async fn jittered_exponential_backoff_delays_restart_attempts() {
         started.elapsed() >= Duration::from_millis(40),
         "equal jitter should keep the first restart delay at least half the base value"
     );
+}
+
+#[tokio::test]
+async fn exponential_backoff_delays_restart_attempts_by_expected_steps() {
+    let (starts_tx, mut starts_rx) = mpsc::unbounded_channel();
+
+    let handle = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 3,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::Exponential {
+                base: Duration::from_millis(40),
+                factor: 2,
+                max: Duration::from_millis(200),
+            },
+        })
+        .child(
+            ChildSpec::new("flaky", move |ctx| {
+                let starts_tx = starts_tx.clone();
+                async move {
+                    starts_tx
+                        .send((ctx.generation, Instant::now()))
+                        .expect("test receiver dropped");
+                    if ctx.generation < 2 {
+                        Err(common::test_error("boom"))
+                    } else {
+                        ctx.token.cancelled().await;
+                        Ok(())
+                    }
+                }
+            })
+            .restart(Restart::Transient),
+        )
+        .build()
+        .expect("valid supervisor")
+        .spawn();
+
+    let (_, started_0) = common::recv_event(&mut starts_rx).await;
+    let (_, started_1) = common::recv_event(&mut starts_rx).await;
+    let (_, started_2) = common::recv_event(&mut starts_rx).await;
+
+    assert!(
+        started_1.duration_since(started_0) >= Duration::from_millis(35),
+        "first exponential delay should be close to base"
+    );
+    assert!(
+        started_2.duration_since(started_1) >= Duration::from_millis(75),
+        "second exponential delay should be close to base * factor"
+    );
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
 }
 
 #[tokio::test]
@@ -229,6 +285,59 @@ async fn child_restart_intensity_override_is_enforced() {
         .expect_err("child-specific restart limit should fail the supervisor");
 
     assert!(matches!(err, SupervisorError::RestartIntensityExceeded));
+}
+
+#[tokio::test]
+async fn restart_budget_recovers_after_failures_age_out_of_window() {
+    let release_second_failure = Arc::new(Notify::new());
+    let (starts_tx, mut starts_rx) = mpsc::unbounded_channel();
+
+    let release_second_failure_for_child = release_second_failure.clone();
+    let handle = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 1,
+            within: Duration::from_millis(100),
+            backoff: BackoffPolicy::None,
+        })
+        .child(
+            ChildSpec::new("flaky", move |ctx| {
+                let release_second_failure = release_second_failure_for_child.clone();
+                let starts_tx = starts_tx.clone();
+                async move {
+                    starts_tx
+                        .send(ctx.generation)
+                        .expect("test receiver dropped");
+                    match ctx.generation {
+                        0 => Err(common::test_error("first boom")),
+                        1 => {
+                            release_second_failure.notified().await;
+                            Err(common::test_error("second boom"))
+                        }
+                        _ => {
+                            ctx.token.cancelled().await;
+                            Ok(())
+                        }
+                    }
+                }
+            })
+            .restart(Restart::Transient),
+        )
+        .build()
+        .expect("valid supervisor")
+        .spawn();
+
+    assert_eq!(common::recv_event(&mut starts_rx).await, 0);
+    assert_eq!(common::recv_event(&mut starts_rx).await, 1);
+
+    sleep(Duration::from_millis(150)).await;
+    release_second_failure.notify_one();
+
+    assert_eq!(common::recv_event(&mut starts_rx).await, 2);
+    common::assert_no_event(&mut starts_rx).await;
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
 }
 
 #[tokio::test]

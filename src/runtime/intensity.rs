@@ -156,6 +156,53 @@ mod tests {
     }
 
     #[test]
+    fn exponential_backoff_progresses_by_factor() {
+        let mut tracker = tracker(BackoffPolicy::Exponential {
+            base: Duration::from_millis(10),
+            factor: 2,
+            max: Duration::from_millis(500),
+        });
+
+        tracker.record(Instant::now());
+        assert_eq!(tracker.backoff(), Duration::from_millis(10));
+
+        tracker.record(Instant::now());
+        assert_eq!(tracker.backoff(), Duration::from_millis(20));
+
+        tracker.record(Instant::now());
+        assert_eq!(tracker.backoff(), Duration::from_millis(40));
+
+        tracker.record(Instant::now());
+        assert_eq!(tracker.backoff(), Duration::from_millis(80));
+    }
+
+    #[test]
+    fn exponential_backoff_with_factor_one_stays_constant() {
+        let mut tracker = tracker(BackoffPolicy::Exponential {
+            base: Duration::from_millis(25),
+            factor: 1,
+            max: Duration::from_millis(500),
+        });
+
+        for _ in 0..4 {
+            tracker.record(Instant::now());
+            assert_eq!(tracker.backoff(), Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn exponential_backoff_overflow_clamps_to_maximum() {
+        let delay = exponential_backoff(
+            Duration::from_secs(u64::MAX / 2 + 1),
+            3,
+            Duration::from_secs(90),
+            1,
+        );
+
+        assert_eq!(delay, Duration::from_secs(90));
+    }
+
+    #[test]
     fn jittered_backoff_stays_within_equal_jitter_bounds() {
         let mut tracker = tracker(BackoffPolicy::JitteredExponential {
             base: Duration::from_millis(80),

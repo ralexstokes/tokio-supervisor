@@ -8,8 +8,8 @@ use tokio::{
     time::{Duration, sleep, timeout},
 };
 use tokio_supervisor::{
-    BackoffPolicy, ChildSpec, Restart, RestartIntensity, ShutdownMode, ShutdownPolicy,
-    SupervisorBuilder, SupervisorEvent, SupervisorExit,
+    BackoffPolicy, ChildSpec, ControlError, Restart, RestartIntensity, ShutdownMode,
+    ShutdownPolicy, SupervisorBuilder, SupervisorError, SupervisorEvent, SupervisorExit,
 };
 
 mod common;
@@ -139,6 +139,96 @@ async fn stubborn_child_is_aborted_in_cooperative_then_abort_mode() {
 }
 
 #[tokio::test]
+async fn cooperative_shutdown_times_out_with_stuck_child_name() {
+    let live_flag = common::LiveFlag::new();
+
+    let live_flag_for_child = live_flag.clone();
+    let supervisor = SupervisorBuilder::new()
+        .child(
+            ChildSpec::new("stubborn", move |_ctx| {
+                let live_flag = live_flag_for_child.clone();
+                async move {
+                    let _guard = live_flag.guard();
+                    loop {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            })
+            .shutdown(ShutdownPolicy {
+                grace: common::SHORT_GRACE,
+                mode: ShutdownMode::Cooperative,
+            }),
+        )
+        .build()
+        .expect("valid supervisor");
+
+    let handle = supervisor.spawn();
+    handle.shutdown();
+
+    let err = handle
+        .wait()
+        .await
+        .expect_err("pure cooperative shutdown should time out");
+    assert_eq!(
+        err,
+        SupervisorError::ShutdownTimedOut("stubborn".to_owned())
+    );
+    assert!(
+        !live_flag.is_live(),
+        "timed-out cooperative child should be aborted before wait resolves"
+    );
+}
+
+#[tokio::test]
+async fn cooperative_remove_child_times_out_with_stuck_child_name() {
+    let live_flag = common::LiveFlag::new();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+
+    let live_flag_for_child = live_flag.clone();
+    let supervisor = SupervisorBuilder::new()
+        .child(
+            ChildSpec::new("stubborn", move |_ctx| {
+                let started_tx = started_tx.clone();
+                let live_flag = live_flag_for_child.clone();
+                async move {
+                    let _guard = live_flag.guard();
+                    started_tx.send(()).expect("test receiver dropped");
+                    loop {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            })
+            .shutdown(ShutdownPolicy {
+                grace: common::SHORT_GRACE,
+                mode: ShutdownMode::Cooperative,
+            }),
+        )
+        .child(ChildSpec::new("keeper", |ctx| async move {
+            ctx.token.cancelled().await;
+            Ok(())
+        }))
+        .build()
+        .expect("valid supervisor");
+
+    let handle = supervisor.spawn();
+    common::recv_event(&mut started_rx).await;
+
+    let err = handle
+        .remove_child("stubborn")
+        .await
+        .expect_err("pure cooperative child removal should time out");
+    assert_eq!(err, ControlError::ShutdownTimedOut("stubborn".to_owned()));
+    assert!(
+        !live_flag.is_live(),
+        "timed-out cooperative removal should abort the child before returning"
+    );
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+#[tokio::test]
 async fn wait_only_resolves_after_child_lifetimes_end() {
     let live_flag = common::LiveFlag::new();
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
@@ -228,6 +318,81 @@ async fn shutdown_preempts_zero_delay_restart() {
 
     let exit = handle.wait().await.expect("shutdown should succeed");
     assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+#[tokio::test]
+async fn shutdown_preempts_delayed_restart_in_cooperative_mode() {
+    let saw_cancel = Arc::new(AtomicBool::new(false));
+
+    let saw_cancel_for_keeper = saw_cancel.clone();
+    let supervisor = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 8,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::Fixed(Duration::from_millis(200)),
+        })
+        .child(
+            ChildSpec::new("flaky", |_ctx| async move {
+                Err(common::test_error("restart later"))
+            })
+            .restart(Restart::Transient),
+        )
+        .child(
+            ChildSpec::new("keeper", move |ctx| {
+                let saw_cancel = saw_cancel_for_keeper.clone();
+                async move {
+                    ctx.token.cancelled().await;
+                    saw_cancel.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .shutdown(ShutdownPolicy {
+                grace: common::SHORT_GRACE,
+                mode: ShutdownMode::Cooperative,
+            }),
+        )
+        .build()
+        .expect("valid supervisor");
+
+    let handle = supervisor.spawn();
+    let mut events = handle.subscribe();
+
+    loop {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::ChildRestartScheduled { id, delay, .. } if id == "flaky" => {
+                assert!(
+                    delay >= Duration::from_millis(200),
+                    "test requires a non-zero delayed restart"
+                );
+                handle.shutdown();
+                break;
+            }
+            SupervisorEvent::RestartIntensityExceeded => {
+                panic!("shutdown lost to delayed restart");
+            }
+            _ => {}
+        }
+    }
+
+    loop {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::SupervisorStopping => break,
+            SupervisorEvent::ChildRestarted { id, .. } if id == "flaky" => {
+                panic!("child restarted after shutdown was requested");
+            }
+            SupervisorEvent::RestartIntensityExceeded => {
+                panic!("shutdown lost to delayed restart");
+            }
+            _ => {}
+        }
+    }
+
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+    assert!(
+        saw_cancel.load(Ordering::SeqCst),
+        "cooperative child should observe shutdown cancellation"
+    );
 }
 
 async fn recv_supervisor_event(

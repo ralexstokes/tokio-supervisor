@@ -57,6 +57,59 @@ fn invalid_jittered_restart_intensity_is_rejected() {
 }
 
 #[test]
+fn invalid_fixed_backoff_delay_is_rejected() {
+    let err = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 1,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::Fixed(Duration::ZERO),
+        })
+        .child(ChildSpec::new("worker", |_| async { Ok(()) }))
+        .build()
+        .expect_err("zero fixed backoff delay should be rejected");
+
+    assert!(matches!(err, BuildError::InvalidConfig(_)));
+}
+
+#[test]
+fn invalid_exponential_restart_factor_is_rejected() {
+    let err = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 1,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::Exponential {
+                base: Duration::from_millis(10),
+                factor: 0,
+                max: Duration::from_millis(20),
+            },
+        })
+        .child(ChildSpec::new("worker", |_| async { Ok(()) }))
+        .build()
+        .expect_err("zero exponential factor should be rejected");
+
+    assert!(matches!(err, BuildError::InvalidConfig(_)));
+}
+
+#[test]
+fn invalid_exponential_restart_max_is_rejected() {
+    let err = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 1,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::Exponential {
+                base: Duration::from_millis(10),
+                factor: 2,
+                max: Duration::ZERO,
+            },
+        })
+        .child(ChildSpec::new("worker", |_| async { Ok(()) }))
+        .build()
+        .expect_err("zero exponential max should be rejected");
+
+    assert!(matches!(err, BuildError::InvalidConfig(_)));
+}
+
+#[test]
 fn invalid_child_restart_intensity_is_rejected() {
     let err = SupervisorBuilder::new()
         .child(

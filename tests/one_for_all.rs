@@ -4,12 +4,12 @@ use std::sync::{
 };
 
 use tokio::{
-    sync::{Barrier, Notify, mpsc},
+    sync::{Barrier, Notify, broadcast, mpsc},
     time::{Duration, timeout},
 };
 use tokio_supervisor::{
     BackoffPolicy, ChildSpec, Restart, RestartIntensity, Strategy, SupervisorBuilder,
-    SupervisorExit,
+    SupervisorEvent, SupervisorExit,
 };
 
 mod common;
@@ -339,4 +339,239 @@ async fn group_restart_uses_the_failing_child_restart_intensity() {
     handle.shutdown();
     let exit = handle.wait().await.expect("shutdown should succeed");
     assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+#[tokio::test]
+async fn group_restart_scheduled_precedes_child_restart_events() {
+    let trigger_attempts = Arc::new(AtomicUsize::new(0));
+
+    let trigger = ChildSpec::new("trigger", move |ctx| {
+        let trigger_attempts = trigger_attempts.clone();
+        async move {
+            if trigger_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(common::test_error("restart group"));
+            }
+
+            ctx.token.cancelled().await;
+            Ok(())
+        }
+    })
+    .restart(Restart::Transient);
+
+    let peer = ChildSpec::new("peer", |ctx| async move {
+        ctx.token.cancelled().await;
+        Ok(())
+    })
+    .restart(Restart::Permanent);
+
+    let handle = SupervisorBuilder::new()
+        .strategy(Strategy::OneForAll)
+        .restart_intensity(RestartIntensity {
+            max_restarts: 2,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::Fixed(Duration::from_millis(40)),
+        })
+        .child(trigger)
+        .child(peer)
+        .build()
+        .expect("valid supervisor")
+        .spawn();
+    let mut events = handle.subscribe();
+
+    let mut sequence = Vec::new();
+    let mut saw_trigger_restart = false;
+    let mut saw_peer_restart = false;
+
+    while !(saw_trigger_restart && saw_peer_restart) {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::ChildExited { id, generation, .. }
+                if id == "trigger" && generation == 0 =>
+            {
+                sequence.push("trigger_exited");
+            }
+            SupervisorEvent::GroupRestartScheduled { delay } => {
+                assert_eq!(delay, Duration::from_millis(40));
+                sequence.push("group_restart_scheduled");
+            }
+            SupervisorEvent::ChildStarted { id, generation }
+                if id == "trigger" && generation == 1 =>
+            {
+                sequence.push("trigger_started");
+            }
+            SupervisorEvent::ChildRestarted {
+                id,
+                old_generation,
+                new_generation,
+            } if id == "trigger" && old_generation == 0 && new_generation == 1 => {
+                saw_trigger_restart = true;
+                sequence.push("trigger_restarted");
+            }
+            SupervisorEvent::ChildStarted { id, generation } if id == "peer" && generation == 1 => {
+                sequence.push("peer_started");
+            }
+            SupervisorEvent::ChildRestarted {
+                id,
+                old_generation,
+                new_generation,
+            } if id == "peer" && old_generation == 0 && new_generation == 1 => {
+                saw_peer_restart = true;
+                sequence.push("peer_restarted");
+            }
+            _ => {}
+        }
+    }
+
+    let group_scheduled = sequence
+        .iter()
+        .position(|event| *event == "group_restart_scheduled")
+        .expect("group restart should be scheduled");
+    let trigger_exited = sequence
+        .iter()
+        .position(|event| *event == "trigger_exited")
+        .expect("trigger exit should be observed");
+    let trigger_started = sequence
+        .iter()
+        .position(|event| *event == "trigger_started")
+        .expect("trigger restart start should be observed");
+    let trigger_restarted = sequence
+        .iter()
+        .position(|event| *event == "trigger_restarted")
+        .expect("trigger restart should be observed");
+    let peer_started = sequence
+        .iter()
+        .position(|event| *event == "peer_started")
+        .expect("peer restart start should be observed");
+    let peer_restarted = sequence
+        .iter()
+        .position(|event| *event == "peer_restarted")
+        .expect("peer restart should be observed");
+
+    assert!(
+        trigger_exited < group_scheduled,
+        "failing child exit must precede group restart scheduling: {sequence:?}"
+    );
+    assert!(
+        group_scheduled < trigger_restarted && group_scheduled < peer_restarted,
+        "group restart must be scheduled before any child restart completes: {sequence:?}"
+    );
+    assert!(
+        trigger_started < trigger_restarted,
+        "trigger restart event ordering regressed: {sequence:?}"
+    );
+    assert!(
+        peer_started < peer_restarted,
+        "peer restart event ordering regressed: {sequence:?}"
+    );
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+#[tokio::test]
+async fn rapid_failures_during_group_restart_do_not_schedule_a_second_group_restart() {
+    let release_trigger_failure = Arc::new(Notify::new());
+    let trigger_attempts = Arc::new(AtomicUsize::new(0));
+    let peer_attempts = Arc::new(AtomicUsize::new(0));
+
+    let release_trigger_failure_for_child = release_trigger_failure.clone();
+    let trigger = ChildSpec::new("trigger", move |ctx| {
+        let release_trigger_failure = release_trigger_failure_for_child.clone();
+        let trigger_attempts = trigger_attempts.clone();
+        async move {
+            if trigger_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                release_trigger_failure.notified().await;
+                return Err(common::test_error("restart group"));
+            }
+
+            ctx.token.cancelled().await;
+            Ok(())
+        }
+    })
+    .restart(Restart::Transient);
+
+    let peer = ChildSpec::new("peer", move |ctx| {
+        let peer_attempts = peer_attempts.clone();
+        async move {
+            if peer_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                ctx.token.cancelled().await;
+                return Err(common::test_error(
+                    "peer failed while group restart drained",
+                ));
+            }
+
+            ctx.token.cancelled().await;
+            Ok(())
+        }
+    })
+    .restart(Restart::Transient);
+
+    let handle = SupervisorBuilder::new()
+        .strategy(Strategy::OneForAll)
+        .restart_intensity(RestartIntensity {
+            max_restarts: 2,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::Fixed(Duration::from_millis(40)),
+        })
+        .child(trigger)
+        .child(peer)
+        .build()
+        .expect("valid supervisor")
+        .spawn();
+    let mut events = handle.subscribe();
+
+    release_trigger_failure.notify_one();
+
+    let mut group_restart_scheduled = 0usize;
+    let mut saw_trigger_restart = false;
+    let mut saw_peer_restart = false;
+
+    while !(saw_trigger_restart && saw_peer_restart) {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::GroupRestartScheduled { .. } => {
+                group_restart_scheduled += 1;
+            }
+            SupervisorEvent::ChildRestarted {
+                id,
+                old_generation,
+                new_generation,
+            } if id == "trigger" && old_generation == 0 && new_generation == 1 => {
+                saw_trigger_restart = true;
+            }
+            SupervisorEvent::ChildRestarted {
+                id,
+                old_generation,
+                new_generation,
+            } if id == "peer" && old_generation == 0 && new_generation == 1 => {
+                saw_peer_restart = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        group_restart_scheduled, 1,
+        "drained failures should not schedule an additional group restart"
+    );
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+async fn recv_supervisor_event(
+    events: &mut broadcast::Receiver<SupervisorEvent>,
+) -> SupervisorEvent {
+    match timeout(common::EVENT_TIMEOUT, events.recv())
+        .await
+        .expect("timed out waiting for supervisor event")
+    {
+        Ok(event) => event,
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            panic!("lagged while reading supervisor events: skipped {skipped}");
+        }
+        Err(broadcast::error::RecvError::Closed) => {
+            panic!("supervisor event stream closed unexpectedly");
+        }
+    }
 }

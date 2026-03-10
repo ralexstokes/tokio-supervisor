@@ -607,6 +607,9 @@ impl SupervisorRuntime {
         if !self.wait_for_restart_delay(delay).await? {
             return Ok(());
         }
+        if self.children[key].membership != MembershipState::Active {
+            return Ok(());
+        }
         let (old_generation, new_generation) = self.spawn_child(key)?;
         self.send_restart_event(
             key,
@@ -671,24 +674,36 @@ impl SupervisorRuntime {
     }
 
     async fn wait_for_restart_delay(&mut self, delay: Duration) -> Result<bool, SupervisorError> {
-        tokio::select! {
-            biased;
-            changed = self.shutdown_rx.changed() => {
-                match changed {
-                    Ok(()) if *self.shutdown_rx.borrow() => {
-                        let result = self.shutdown_all().await;
-                        self.pending_exit = Some(result);
-                        Ok(false)
-                    }
-                    Ok(()) => Ok(true),
-                    Err(_) => {
-                        let result = self.shutdown_all().await;
-                        self.pending_exit = Some(result);
-                        Ok(false)
+        let deadline = Instant::now() + delay;
+        loop {
+            tokio::select! {
+                biased;
+                changed = self.shutdown_rx.changed() => {
+                    match changed {
+                        Ok(()) if *self.shutdown_rx.borrow() => {
+                            let result = self.shutdown_all().await;
+                            self.pending_exit = Some(result);
+                            return Ok(false);
+                        }
+                        Ok(()) => {}
+                        Err(_) => {
+                            let result = self.shutdown_all().await;
+                            self.pending_exit = Some(result);
+                            return Ok(false);
+                        }
                     }
                 }
+                command = self.command_rx.recv(), if self.commands_open => {
+                    match command {
+                        Some(command) => Box::pin(self.handle_command(command)).await,
+                        None => self.commands_open = false,
+                    }
+                    if self.pending_exit.is_some() {
+                        return Ok(false);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return Ok(true),
             }
-            _ = tokio::time::sleep(delay) => Ok(true),
         }
     }
 
