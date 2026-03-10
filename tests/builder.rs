@@ -38,6 +38,25 @@ fn invalid_restart_intensity_is_rejected() {
 }
 
 #[test]
+fn invalid_jittered_restart_intensity_is_rejected() {
+    let err = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 1,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::JitteredExponential {
+                base: Duration::ZERO,
+                factor: 2,
+                max: Duration::from_millis(10),
+            },
+        })
+        .child(ChildSpec::new("worker", |_| async { Ok(()) }))
+        .build()
+        .expect_err("invalid jittered exponential backoff should be rejected");
+
+    assert!(matches!(err, BuildError::InvalidConfig(_)));
+}
+
+#[test]
 fn invalid_child_restart_intensity_is_rejected() {
     let err = SupervisorBuilder::new()
         .child(

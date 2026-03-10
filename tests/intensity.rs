@@ -66,6 +66,38 @@ async fn configured_backoff_delays_restart_attempts() {
 }
 
 #[tokio::test]
+async fn jittered_exponential_backoff_delays_restart_attempts() {
+    let supervisor = SupervisorBuilder::new()
+        .restart_intensity(RestartIntensity {
+            max_restarts: 1,
+            within: Duration::from_secs(1),
+            backoff: BackoffPolicy::JitteredExponential {
+                base: Duration::from_millis(80),
+                factor: 2,
+                max: Duration::from_millis(500),
+            },
+        })
+        .child(
+            ChildSpec::new("flaky", |_| async { Err(common::test_error("boom")) })
+                .restart(Restart::Transient),
+        )
+        .build()
+        .expect("valid supervisor");
+
+    let started = Instant::now();
+    let err = supervisor
+        .run()
+        .await
+        .expect_err("supervisor should eventually fail once restart intensity is exceeded");
+
+    assert!(matches!(err, SupervisorError::RestartIntensityExceeded));
+    assert!(
+        started.elapsed() >= Duration::from_millis(40),
+        "equal jitter should keep the first restart delay at least half the base value"
+    );
+}
+
+#[tokio::test]
 async fn child_restart_intensity_override_controls_backoff() {
     let supervisor = SupervisorBuilder::new()
         .restart_intensity(RestartIntensity {

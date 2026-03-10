@@ -26,8 +26,6 @@ The core runtime is implemented and tested, but there is still room for targeted
 The remaining feature backlog is:
 
 * readiness protocol
-* jittered exponential backoff
-
 * health probes
 
 ## Out of scope

@@ -30,6 +30,11 @@ pub enum BackoffPolicy {
         factor: u32,
         max: Duration,
     },
+    JitteredExponential {
+        base: Duration,
+        factor: u32,
+        max: Duration,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +71,8 @@ impl RestartIntensity {
                     ));
                 }
             }
-            BackoffPolicy::Exponential { base, factor, max } => {
+            BackoffPolicy::Exponential { base, factor, max }
+            | BackoffPolicy::JitteredExponential { base, factor, max } => {
                 if base.is_zero() {
                     return Err(BuildError::InvalidConfig(
                         "exponential backoff base must be non-zero",
