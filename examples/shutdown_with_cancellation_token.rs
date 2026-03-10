@@ -1,5 +1,5 @@
 use tokio::time::{Duration, sleep};
-use tokio_supervisor::{ChildSpec, SupervisorBuilder, SupervisorExit};
+use tokio_supervisor::prelude::*;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]

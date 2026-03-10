@@ -1,5 +1,5 @@
 use tokio::time::{Duration, sleep, timeout};
-use tokio_supervisor::{ChildSpec, SupervisorBuilder, SupervisorEvent, SupervisorExit};
+use tokio_supervisor::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,52 +102,52 @@ async fn wait_for_child_started(
     events: &mut tokio::sync::broadcast::Receiver<SupervisorEvent>,
     child_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let event = timeout(Duration::from_secs(2), events.recv()).await??;
-        println!("event: {event:?}");
-
-        if matches!(
-            event,
-            SupervisorEvent::ChildStarted { ref id, .. } if id == child_id
-        ) {
-            return Ok(());
-        }
-    }
+    let event = timeout(
+        Duration::from_secs(2),
+        events.wait_for_event(
+            |event| matches!(event, SupervisorEvent::ChildStarted { id, .. } if id == child_id),
+        ),
+    )
+    .await??;
+    println!("event: {event:?}");
+    Ok(())
 }
 
 async fn wait_for_child_removed(
     events: &mut tokio::sync::broadcast::Receiver<SupervisorEvent>,
     child_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let event = timeout(Duration::from_secs(2), events.recv()).await??;
-        println!("event: {event:?}");
-
-        if matches!(event, SupervisorEvent::ChildRemoved { ref id } if id == child_id) {
-            return Ok(());
-        }
-    }
+    let event = timeout(
+        Duration::from_secs(2),
+        events.wait_for_event(
+            |event| matches!(event, SupervisorEvent::ChildRemoved { id } if id == child_id),
+        ),
+    )
+    .await??;
+    println!("event: {event:?}");
+    Ok(())
 }
 
 async fn wait_for_nested_supervisor_started(
     events: &mut tokio::sync::broadcast::Receiver<SupervisorEvent>,
     nested_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let event = timeout(Duration::from_secs(2), events.recv()).await??;
-        println!("event: {event:?}");
-
-        if matches!(
-            event,
-            SupervisorEvent::Nested {
-                ref id,
-                generation: 0,
-                ref event,
-            } if id == nested_id && matches!(**event, SupervisorEvent::SupervisorStarted)
-        ) {
-            return Ok(());
-        }
-    }
+    let event = timeout(
+        Duration::from_secs(2),
+        events.wait_for_event(|event| {
+            matches!(
+                event,
+                SupervisorEvent::Nested {
+                    id,
+                    generation: 0,
+                    event,
+                } if id == nested_id && matches!(**event, SupervisorEvent::SupervisorStarted)
+            )
+        }),
+    )
+    .await??;
+    println!("event: {event:?}");
+    Ok(())
 }
 
 async fn wait_for_nested_child_started(
@@ -155,28 +155,29 @@ async fn wait_for_nested_child_started(
     nested_id: &str,
     child_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let event = timeout(Duration::from_secs(2), events.recv()).await??;
-        println!("event: {event:?}");
-
-        if matches!(
-            event,
-            SupervisorEvent::Nested {
-                ref id,
-                generation: 0,
-                ref event,
-            } if id == nested_id
-                && matches!(
-                    **event,
-                    SupervisorEvent::ChildStarted {
-                        ref id,
-                        generation: 0,
-                    } if id == child_id
-                )
-        ) {
-            return Ok(());
-        }
-    }
+    let event = timeout(
+        Duration::from_secs(2),
+        events.wait_for_event(|event| {
+            matches!(
+                event,
+                SupervisorEvent::Nested {
+                    id,
+                    generation: 0,
+                    event,
+                } if id == nested_id
+                    && matches!(
+                        **event,
+                        SupervisorEvent::ChildStarted {
+                            ref id,
+                            generation: 0,
+                        } if id == child_id
+                    )
+            )
+        }),
+    )
+    .await??;
+    println!("event: {event:?}");
+    Ok(())
 }
 
 async fn wait_for_nested_child_removed(
@@ -184,23 +185,21 @@ async fn wait_for_nested_child_removed(
     nested_id: &str,
     child_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let event = timeout(Duration::from_secs(2), events.recv()).await??;
-        println!("event: {event:?}");
-
-        if matches!(
-            event,
-            SupervisorEvent::Nested {
-                ref id,
-                generation: 0,
-                ref event,
-            } if id == nested_id
-                && matches!(
-                    **event,
-                    SupervisorEvent::ChildRemoved { ref id } if id == child_id
-                )
-        ) {
-            return Ok(());
-        }
-    }
+    let event = timeout(
+        Duration::from_secs(2),
+        events.wait_for_event(|event| {
+            matches!(
+                event,
+                SupervisorEvent::Nested {
+                    id,
+                    generation: 0,
+                    event,
+                } if id == nested_id
+                    && matches!(**event, SupervisorEvent::ChildRemoved { ref id } if id == child_id)
+            )
+        }),
+    )
+    .await??;
+    println!("event: {event:?}");
+    Ok(())
 }

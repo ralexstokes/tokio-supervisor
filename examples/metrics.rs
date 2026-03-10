@@ -8,7 +8,7 @@ use std::sync::{
 #[cfg(feature = "metrics")]
 use tokio::time::{Duration, sleep};
 #[cfg(feature = "metrics")]
-use tokio_supervisor::{ChildSpec, Restart, SupervisorBuilder, SupervisorExit};
+use tokio_supervisor::prelude::*;
 
 #[cfg(feature = "metrics")]
 #[tokio::main]

@@ -4,9 +4,7 @@ use std::sync::{
 };
 
 use tokio::time::{Duration, sleep};
-use tokio_supervisor::{
-    BackoffPolicy, ChildSpec, Restart, RestartIntensity, SupervisorBuilder, SupervisorExit,
-};
+use tokio_supervisor::prelude::*;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 #[tokio::main]

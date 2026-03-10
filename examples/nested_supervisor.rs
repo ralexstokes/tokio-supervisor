@@ -4,9 +4,7 @@ use std::sync::{
 };
 
 use tokio::time::{Duration, sleep, timeout};
-use tokio_supervisor::{
-    BoxError, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorEvent, SupervisorExit,
-};
+use tokio_supervisor::prelude::*;
 
 fn example_error(message: &'static str) -> BoxError {
     Box::new(std::io::Error::other(message))

@@ -10,7 +10,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, sleep, timeout},
 };
-use tokio_supervisor::{BoxError, ChildSpec, Restart, Strategy, SupervisorBuilder, SupervisorExit};
+use tokio_supervisor::prelude::*;
 
 fn example_error(message: &'static str) -> BoxError {
     Box::new(std::io::Error::other(message))
