@@ -4,8 +4,8 @@ use crate::{
     error::{SupervisorError, SupervisorExit},
     event::SupervisorEvent,
     runtime::{
-        child_runtime::{ChildRuntime, RuntimeChildState},
-        supervision::{DrainReason, SupervisorState},
+        child_runtime::RuntimeChildState,
+        supervision::{ChildEntry, DrainReason, MembershipState, SupervisorState},
     },
     shutdown::ShutdownMode,
 };
@@ -29,11 +29,15 @@ impl SupervisorRuntime {
 
     fn cancel_running_children(&mut self) {
         for child in self.children.iter_mut().rev() {
+            if child.membership == MembershipState::Removed {
+                continue;
+            }
+
             if matches!(
-                child.state,
+                child.runtime.state,
                 RuntimeChildState::Running | RuntimeChildState::Starting
             ) {
-                child.state = RuntimeChildState::Stopping;
+                child.runtime.state = RuntimeChildState::Stopping;
             }
         }
         // Child tokens are children of group_token, so this cancels all of them.
@@ -44,12 +48,12 @@ impl SupervisorRuntime {
         let mut max_grace: Option<std::time::Duration> = None;
 
         for child in &self.children {
-            if !child.state.is_active() {
+            if child.membership == MembershipState::Removed || !child.runtime.state.is_active() {
                 continue;
             }
 
-            let grace = child.spec.shutdown_policy.grace;
-            match child.spec.shutdown_policy.mode {
+            let grace = child.runtime.spec.shutdown_policy.grace;
+            match child.runtime.spec.shutdown_policy.mode {
                 ShutdownMode::Abort => {}
                 ShutdownMode::Cooperative | ShutdownMode::CooperativeThenAbort => {
                     max_grace = Some(max_grace.map_or(grace, |current| current.max(grace)));
@@ -58,7 +62,7 @@ impl SupervisorRuntime {
         }
 
         abort_matching_children(&self.children, |child| {
-            matches!(child.spec.shutdown_policy.mode, ShutdownMode::Abort)
+            matches!(child.runtime.spec.shutdown_policy.mode, ShutdownMode::Abort)
         });
 
         if let Some(grace) = max_grace {
@@ -82,14 +86,16 @@ impl SupervisorRuntime {
             }
         }
 
-        let timed_out = cooperative_timeout_names(&self.children, &self.child_names);
+        let timed_out = cooperative_timeout_names(&self.children);
         if !timed_out.is_empty() {
             abort_matching_children(&self.children, |child| {
-                matches!(child.spec.shutdown_policy.mode, ShutdownMode::Cooperative)
-                    || matches!(
-                        child.spec.shutdown_policy.mode,
-                        ShutdownMode::CooperativeThenAbort | ShutdownMode::Abort
-                    )
+                matches!(
+                    child.runtime.spec.shutdown_policy.mode,
+                    ShutdownMode::Cooperative
+                ) || matches!(
+                    child.runtime.spec.shutdown_policy.mode,
+                    ShutdownMode::CooperativeThenAbort | ShutdownMode::Abort
+                )
             });
             self.drain_join_set(reason).await?;
             return Err(SupervisorError::ShutdownTimedOut(timed_out));
@@ -97,7 +103,7 @@ impl SupervisorRuntime {
 
         abort_matching_children(&self.children, |child| {
             matches!(
-                child.spec.shutdown_policy.mode,
+                child.runtime.spec.shutdown_policy.mode,
                 ShutdownMode::CooperativeThenAbort | ShutdownMode::Abort
             )
         });
@@ -112,26 +118,30 @@ impl SupervisorRuntime {
     }
 }
 
-fn abort_matching_children(children: &[ChildRuntime], predicate: impl Fn(&ChildRuntime) -> bool) {
+fn abort_matching_children(children: &[ChildEntry], predicate: impl Fn(&ChildEntry) -> bool) {
     for child in children {
-        if child.state.is_active()
+        if child.membership != MembershipState::Removed
+            && child.runtime.state.is_active()
             && predicate(child)
-            && let Some(abort_handle) = child.abort_handle.as_ref()
+            && let Some(abort_handle) = child.runtime.abort_handle.as_ref()
         {
             abort_handle.abort();
         }
     }
 }
 
-fn cooperative_timeout_names(children: &[ChildRuntime], child_names: &[String]) -> String {
+fn cooperative_timeout_names(children: &[ChildEntry]) -> String {
     let ids: Vec<&str> = children
         .iter()
-        .zip(child_names)
-        .filter(|(child, _)| {
-            child.state.is_active()
-                && matches!(child.spec.shutdown_policy.mode, ShutdownMode::Cooperative)
+        .filter(|child| {
+            child.membership != MembershipState::Removed
+                && child.runtime.state.is_active()
+                && matches!(
+                    child.runtime.spec.shutdown_policy.mode,
+                    ShutdownMode::Cooperative
+                )
         })
-        .map(|(_, name)| name.as_str())
+        .map(|child| child.id.as_str())
         .collect();
     ids.join(", ")
 }

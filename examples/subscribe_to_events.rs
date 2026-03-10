@@ -61,6 +61,12 @@ fn print_event(event: &SupervisorEvent, depth: usize) {
         SupervisorEvent::ChildStarted { id, generation } => {
             println!("{indent}child started: {id} generation={generation}");
         }
+        SupervisorEvent::ChildRemoveRequested { id } => {
+            println!("{indent}child removal requested: {id}");
+        }
+        SupervisorEvent::ChildRemoved { id } => {
+            println!("{indent}child removed: {id}");
+        }
         SupervisorEvent::ChildExited {
             id,
             generation,

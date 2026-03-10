@@ -20,6 +20,28 @@ pub enum SupervisorError {
     Internal(String),
 }
 
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum ControlError {
+    #[error("duplicate child id: {0}")]
+    DuplicateChildId(String),
+    #[error("unknown child id: {0}")]
+    UnknownChildId(String),
+    #[error("child removal already in progress: {0}")]
+    ChildRemovalInProgress(String),
+    #[error("invalid child configuration: {0}")]
+    InvalidConfig(&'static str),
+    #[error("cannot remove the last active child")]
+    LastChildRemovalUnsupported,
+    #[error("supervisor is stopping")]
+    SupervisorStopping,
+    #[error("child removal timed out: {0}")]
+    ShutdownTimedOut(String),
+    #[error("supervisor control plane is unavailable")]
+    Unavailable,
+    #[error("internal supervisor control error: {0}")]
+    Internal(String),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupervisorExit {
     Shutdown,

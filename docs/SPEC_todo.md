@@ -25,8 +25,6 @@ The core runtime is implemented and tested, but there is still room for targeted
 
 The remaining feature backlog is:
 
-* dynamic add/remove child at runtime
-
 * readiness protocol
 * jittered exponential backoff
 

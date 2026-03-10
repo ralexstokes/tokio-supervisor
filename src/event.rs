@@ -30,6 +30,12 @@ pub enum SupervisorEvent {
         id: String,
         generation: u64,
     },
+    ChildRemoveRequested {
+        id: String,
+    },
+    ChildRemoved {
+        id: String,
+    },
     ChildExited {
         id: String,
         generation: u64,

@@ -108,6 +108,221 @@ async fn parent_shutdown_propagates_into_nested_supervisor() {
 }
 
 #[tokio::test]
+async fn dynamically_added_nested_supervisor_can_be_removed() {
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let cancellations = Arc::new(AtomicUsize::new(0));
+
+    let nested_cancellations = cancellations.clone();
+    let nested = SupervisorBuilder::new()
+        .child(ChildSpec::new("leaf", move |ctx| {
+            let started_tx = started_tx.clone();
+            let cancellations = nested_cancellations.clone();
+            async move {
+                started_tx.send(()).expect("test receiver dropped");
+                ctx.token.cancelled().await;
+                cancellations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }))
+        .build()
+        .expect("valid nested supervisor");
+
+    let outer = SupervisorBuilder::new()
+        .child(ChildSpec::new("anchor", |ctx| async move {
+            ctx.token.cancelled().await;
+            Ok(())
+        }))
+        .build()
+        .expect("valid outer supervisor");
+
+    let handle = outer.spawn();
+    let mut events = handle.subscribe();
+
+    handle
+        .add_child(nested.into_child_spec("nested"))
+        .await
+        .expect("dynamic nested child should be accepted");
+    common::recv_event(&mut started_rx).await;
+
+    handle
+        .remove_child("nested")
+        .await
+        .expect("dynamic nested child should be removable");
+
+    let mut saw_nested_supervisor_started = false;
+    let mut saw_nested_leaf_started = false;
+    let mut saw_remove_requested = false;
+    let mut saw_removed = false;
+
+    while !(saw_nested_supervisor_started
+        && saw_nested_leaf_started
+        && saw_remove_requested
+        && saw_removed)
+    {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::Nested {
+                id,
+                generation,
+                event,
+            } if id == "nested"
+                && generation == 0
+                && matches!(*event, SupervisorEvent::SupervisorStarted) =>
+            {
+                saw_nested_supervisor_started = true;
+            }
+            SupervisorEvent::Nested {
+                id,
+                generation,
+                event,
+            } if id == "nested"
+                && generation == 0
+                && matches!(*event, SupervisorEvent::ChildStarted { ref id, generation: 0 } if id == "leaf") =>
+            {
+                saw_nested_leaf_started = true;
+            }
+            SupervisorEvent::ChildRemoveRequested { id } if id == "nested" => {
+                saw_remove_requested = true;
+            }
+            SupervisorEvent::ChildRemoved { id } if id == "nested" => {
+                saw_removed = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+#[tokio::test]
+async fn root_handle_can_add_and_remove_children_inside_nested_supervisor() {
+    let (seed_tx, mut seed_rx) = mpsc::unbounded_channel();
+    let (dynamic_tx, mut dynamic_rx) = mpsc::unbounded_channel();
+    let dynamic_cancellations = Arc::new(AtomicUsize::new(0));
+
+    let nested = SupervisorBuilder::new()
+        .child(ChildSpec::new("seed", move |ctx| {
+            let seed_tx = seed_tx.clone();
+            async move {
+                seed_tx.send(()).expect("test receiver dropped");
+                ctx.token.cancelled().await;
+                Ok(())
+            }
+        }))
+        .build()
+        .expect("valid nested supervisor");
+
+    let outer = SupervisorBuilder::new()
+        .child(ChildSpec::new("anchor", |ctx| async move {
+            ctx.token.cancelled().await;
+            Ok(())
+        }))
+        .build()
+        .expect("valid outer supervisor");
+
+    let handle = outer.spawn();
+    let mut events = handle.subscribe();
+
+    handle
+        .add_child(nested.into_child_spec("nested"))
+        .await
+        .expect("dynamic nested child should be accepted");
+
+    let mut saw_nested_supervisor_started = false;
+    while !saw_nested_supervisor_started {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::Nested {
+                id,
+                generation,
+                event,
+            } if id == "nested"
+                && generation == 0
+                && matches!(*event, SupervisorEvent::SupervisorStarted) =>
+            {
+                saw_nested_supervisor_started = true;
+            }
+            _ => {}
+        }
+    }
+
+    common::recv_event(&mut seed_rx).await;
+
+    let dynamic_cancellations_for_child = dynamic_cancellations.clone();
+    handle
+        .add_child_at(
+            ["nested"],
+            ChildSpec::new("dynamic", move |ctx| {
+                let dynamic_tx = dynamic_tx.clone();
+                let dynamic_cancellations = dynamic_cancellations_for_child.clone();
+                async move {
+                    dynamic_tx.send(()).expect("test receiver dropped");
+                    ctx.token.cancelled().await;
+                    dynamic_cancellations.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+        )
+        .await
+        .expect("dynamic child inside nested supervisor should be accepted");
+
+    common::recv_event(&mut dynamic_rx).await;
+
+    handle
+        .remove_child_at(["nested"], "dynamic")
+        .await
+        .expect("dynamic child inside nested supervisor should be removable");
+
+    let mut saw_nested_dynamic_started = false;
+    let mut saw_nested_remove_requested = false;
+    let mut saw_nested_removed = false;
+
+    while !(saw_nested_dynamic_started && saw_nested_remove_requested && saw_nested_removed) {
+        match recv_supervisor_event(&mut events).await {
+            SupervisorEvent::Nested {
+                id,
+                generation,
+                event,
+            } if id == "nested"
+                && generation == 0
+                && matches!(*event, SupervisorEvent::ChildStarted { ref id, generation: 0 } if id == "dynamic") =>
+            {
+                saw_nested_dynamic_started = true;
+            }
+            SupervisorEvent::Nested {
+                id,
+                generation,
+                event,
+            } if id == "nested"
+                && generation == 0
+                && matches!(*event, SupervisorEvent::ChildRemoveRequested { ref id } if id == "dynamic") =>
+            {
+                saw_nested_remove_requested = true;
+            }
+            SupervisorEvent::Nested {
+                id,
+                generation,
+                event,
+            } if id == "nested"
+                && generation == 0
+                && matches!(*event, SupervisorEvent::ChildRemoved { ref id } if id == "dynamic") =>
+            {
+                saw_nested_removed = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(dynamic_cancellations.load(Ordering::SeqCst), 1);
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+}
+
+#[tokio::test]
 async fn parent_event_stream_includes_forwarded_nested_events() {
     let nested = SupervisorBuilder::new()
         .child(ChildSpec::new("leaf", |_ctx| async move { Ok(()) }).restart(Restart::Temporary))

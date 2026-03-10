@@ -1,13 +1,16 @@
 use std::{io::Error, sync::Arc};
 
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::{
     child::{ChildResult, ChildSpec, ChildSpecInner},
     context::ChildContext,
     error::{SupervisorError, SupervisorExit},
     event::forward_nested_event,
-    handle::SupervisorHandle,
+    handle::{
+        NestedControlRegistry, NestedControlScope, SupervisorCommand, SupervisorHandle,
+        SupervisorHandleInit, current_nested_control_scope,
+    },
     restart::RestartIntensity,
     runtime::SupervisorRuntime,
     strategy::Strategy,
@@ -33,23 +36,59 @@ impl Supervisor {
     pub async fn run(self) -> Result<SupervisorExit, SupervisorError> {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (events_tx, _) = broadcast::channel(256);
-        self.run_with_channels(shutdown_rx, events_tx).await
+        let (_command_tx, command_rx) = mpsc::unbounded_channel();
+        self.run_with_channels(
+            shutdown_rx,
+            events_tx,
+            command_rx,
+            Arc::new(NestedControlRegistry::default()),
+            Vec::new(),
+        )
+        .await
     }
 
     pub fn spawn(self) -> SupervisorHandle {
+        self.spawn_with_control(Arc::new(NestedControlRegistry::default()), Vec::new())
+    }
+
+    fn spawn_with_control(
+        self,
+        registry: Arc<NestedControlRegistry>,
+        path_prefix: Vec<String>,
+    ) -> SupervisorHandle {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (done_tx, done_rx) = watch::channel(None);
         let (events_tx, _) = broadcast::channel(256);
         let task_done_tx = done_tx.clone();
         let task_events_tx = events_tx.clone();
+        let task_registry = Arc::clone(&registry);
+        let task_path_prefix = path_prefix.clone();
 
         let join_handle = tokio::spawn(async move {
-            let result = self.run_with_channels(shutdown_rx, task_events_tx).await;
+            let result = self
+                .run_with_channels(
+                    shutdown_rx,
+                    task_events_tx,
+                    command_rx,
+                    task_registry,
+                    task_path_prefix,
+                )
+                .await;
             let _ = task_done_tx.send(Some(result.clone()));
             result
         });
 
-        SupervisorHandle::new(shutdown_tx, done_tx, done_rx, events_tx, join_handle)
+        SupervisorHandle::new(SupervisorHandleInit {
+            shutdown_tx,
+            command_tx,
+            registry,
+            path_prefix,
+            done_tx,
+            done_rx,
+            events_tx,
+            join_handle,
+        })
     }
 
     /// Adapts this supervisor into a restartable child of another supervisor.
@@ -66,23 +105,40 @@ impl Supervisor {
         self,
         shutdown_rx: watch::Receiver<bool>,
         events_tx: broadcast::Sender<crate::event::SupervisorEvent>,
+        command_rx: mpsc::UnboundedReceiver<SupervisorCommand>,
+        registry: Arc<NestedControlRegistry>,
+        path_prefix: Vec<String>,
     ) -> Result<SupervisorExit, SupervisorError> {
-        let mut runtime = SupervisorRuntime::new(self.config, shutdown_rx, events_tx);
+        let mut runtime = SupervisorRuntime::new(
+            self.config,
+            shutdown_rx,
+            events_tx,
+            command_rx,
+            registry,
+            path_prefix,
+        );
         runtime.run().await
     }
 
     async fn run_as_child(self, ctx: ChildContext) -> ChildResult {
         let child_id = ctx.id.clone();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (events_tx, mut events_rx) = broadcast::channel(256);
-        let run = self.run_with_channels(shutdown_rx, events_tx);
-        tokio::pin!(run);
+        let control_scope = current_nested_control_scope().unwrap_or_else(|| {
+            NestedControlScope::new(
+                Arc::new(NestedControlRegistry::default()),
+                vec![child_id.clone()],
+            )
+        });
+        let handle = self.spawn_with_control(control_scope.registry(), control_scope.child_path());
+        let _registration = control_scope.register(handle.control_endpoint());
+        let mut events_rx = handle.subscribe();
+        let wait = handle.wait();
+        tokio::pin!(wait);
         let mut shutdown_requested = false;
 
         loop {
             tokio::select! {
                 biased;
-                result = &mut run => {
+                result = &mut wait => {
                     drain_nested_events(&mut events_rx);
                     return match result {
                         Ok(SupervisorExit::Completed | SupervisorExit::Shutdown) => Ok(()),
@@ -101,7 +157,7 @@ impl Supervisor {
                 }
                 _ = ctx.token.cancelled(), if !shutdown_requested => {
                     shutdown_requested = true;
-                    let _ = shutdown_tx.send(true);
+                    handle.shutdown();
                 }
             }
         }

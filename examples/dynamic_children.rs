@@ -1,0 +1,206 @@
+use tokio::time::{Duration, sleep, timeout};
+use tokio_supervisor::{ChildSpec, SupervisorBuilder, SupervisorEvent, SupervisorExit};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let supervisor = SupervisorBuilder::new()
+        .child(ChildSpec::new("api", |ctx| async move {
+            println!("api started in generation {}", ctx.generation);
+            ctx.token.cancelled().await;
+            println!("api shutting down");
+            Ok(())
+        }))
+        .build()?;
+
+    let handle = supervisor.spawn();
+    let mut events = handle.subscribe();
+
+    wait_for_child_started(&mut events, "api").await?;
+
+    handle
+        .add_child(ChildSpec::new("cache-warmer", |ctx| async move {
+            println!("cache-warmer started in generation {}", ctx.generation);
+
+            loop {
+                tokio::select! {
+                    _ = ctx.token.cancelled() => {
+                        println!("cache-warmer received removal/shutdown");
+                        return Ok(());
+                    }
+                    _ = sleep(Duration::from_millis(50)) => {
+                        println!("cache-warmer tick");
+                    }
+                }
+            }
+        }))
+        .await?;
+
+    wait_for_child_started(&mut events, "cache-warmer").await?;
+    println!("cache-warmer added at runtime");
+
+    // Let the child do visible work before demonstrating runtime removal.
+    sleep(Duration::from_millis(150)).await;
+
+    handle.remove_child("cache-warmer").await?;
+    wait_for_child_removed(&mut events, "cache-warmer").await?;
+    println!("cache-warmer removed at runtime");
+
+    let nested = SupervisorBuilder::new()
+        .child(ChildSpec::new("seed", |ctx| async move {
+            println!("nested seed started in generation {}", ctx.generation);
+            ctx.token.cancelled().await;
+            println!("nested seed shutting down");
+            Ok(())
+        }))
+        .build()?;
+
+    handle.add_child(nested.into_child_spec("nested")).await?;
+    wait_for_nested_supervisor_started(&mut events, "nested").await?;
+    wait_for_nested_child_started(&mut events, "nested", "seed").await?;
+    println!("nested supervisor added at runtime");
+
+    handle
+        .add_child_at(
+            ["nested"],
+            ChildSpec::new("nested-cache", |ctx| async move {
+                println!("nested-cache started in generation {}", ctx.generation);
+
+                loop {
+                    tokio::select! {
+                        _ = ctx.token.cancelled() => {
+                            println!("nested-cache received removal/shutdown");
+                            return Ok(());
+                        }
+                        _ = sleep(Duration::from_millis(50)) => {
+                            println!("nested-cache tick");
+                        }
+                    }
+                }
+            }),
+        )
+        .await?;
+
+    wait_for_nested_child_started(&mut events, "nested", "nested-cache").await?;
+    println!("nested-cache added inside nested supervisor");
+
+    // Let the child do visible work before demonstrating runtime removal.
+    sleep(Duration::from_millis(150)).await;
+
+    handle.remove_child_at(["nested"], "nested-cache").await?;
+    wait_for_nested_child_removed(&mut events, "nested", "nested-cache").await?;
+    println!("nested-cache removed from nested supervisor");
+
+    handle.shutdown();
+    let exit = handle.wait().await?;
+    assert_eq!(exit, SupervisorExit::Shutdown);
+    println!("supervisor exited with {exit:?}");
+
+    Ok(())
+}
+
+async fn wait_for_child_started(
+    events: &mut tokio::sync::broadcast::Receiver<SupervisorEvent>,
+    child_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let event = timeout(Duration::from_secs(2), events.recv()).await??;
+        println!("event: {event:?}");
+
+        if matches!(
+            event,
+            SupervisorEvent::ChildStarted { ref id, .. } if id == child_id
+        ) {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_child_removed(
+    events: &mut tokio::sync::broadcast::Receiver<SupervisorEvent>,
+    child_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let event = timeout(Duration::from_secs(2), events.recv()).await??;
+        println!("event: {event:?}");
+
+        if matches!(event, SupervisorEvent::ChildRemoved { ref id } if id == child_id) {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_nested_supervisor_started(
+    events: &mut tokio::sync::broadcast::Receiver<SupervisorEvent>,
+    nested_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let event = timeout(Duration::from_secs(2), events.recv()).await??;
+        println!("event: {event:?}");
+
+        if matches!(
+            event,
+            SupervisorEvent::Nested {
+                ref id,
+                generation: 0,
+                ref event,
+            } if id == nested_id && matches!(**event, SupervisorEvent::SupervisorStarted)
+        ) {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_nested_child_started(
+    events: &mut tokio::sync::broadcast::Receiver<SupervisorEvent>,
+    nested_id: &str,
+    child_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let event = timeout(Duration::from_secs(2), events.recv()).await??;
+        println!("event: {event:?}");
+
+        if matches!(
+            event,
+            SupervisorEvent::Nested {
+                ref id,
+                generation: 0,
+                ref event,
+            } if id == nested_id
+                && matches!(
+                    **event,
+                    SupervisorEvent::ChildStarted {
+                        ref id,
+                        generation: 0,
+                    } if id == child_id
+                )
+        ) {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_nested_child_removed(
+    events: &mut tokio::sync::broadcast::Receiver<SupervisorEvent>,
+    nested_id: &str,
+    child_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let event = timeout(Duration::from_secs(2), events.recv()).await??;
+        println!("event: {event:?}");
+
+        if matches!(
+            event,
+            SupervisorEvent::Nested {
+                ref id,
+                generation: 0,
+                ref event,
+            } if id == nested_id
+                && matches!(
+                    **event,
+                    SupervisorEvent::ChildRemoved { ref id } if id == child_id
+                )
+        ) {
+            return Ok(());
+        }
+    }
+}
