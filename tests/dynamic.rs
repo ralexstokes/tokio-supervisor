@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use tokio::{
-    sync::{Notify, broadcast, mpsc},
+    sync::{Notify, mpsc},
     time::timeout,
 };
 use tokio_supervisor::{
-    ChildSpec, ControlError, Restart, SupervisorBuilder, SupervisorEvent, SupervisorExit,
+    ChildSpec, ControlError, Restart, ShutdownMode, ShutdownPolicy, SupervisorBuilder,
+    SupervisorEvent, SupervisorExit,
 };
 
 mod common;
@@ -82,7 +83,7 @@ async fn remove_child_stops_it_without_restarting() {
     let mut saw_remove_requested = false;
     let mut saw_removed = false;
     while !saw_remove_requested || !saw_removed {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::ChildRemoveRequested { id } if id == "removable" => {
                 saw_remove_requested = true;
             }
@@ -219,6 +220,10 @@ async fn concurrent_removal_requests_are_serialized() {
 async fn removal_returns_supervisor_stopping_when_shutdown_intervenes() {
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
     let (cancelled_tx, mut cancelled_rx) = mpsc::unbounded_channel();
+    let fast_shutdown = ShutdownPolicy {
+        grace: common::SHORT_GRACE,
+        mode: ShutdownMode::CooperativeThenAbort,
+    };
 
     let supervisor = SupervisorBuilder::new()
         .child(
@@ -229,16 +234,20 @@ async fn removal_returns_supervisor_stopping_when_shutdown_intervenes() {
                     started_tx.send(()).expect("test receiver dropped");
                     ctx.token.cancelled().await;
                     cancelled_tx.send(()).expect("test receiver dropped");
-                    tokio::time::sleep(common::EVENT_TIMEOUT).await;
+                    std::future::pending::<()>().await;
                     Ok(())
                 }
             })
-            .restart(Restart::Transient),
+            .restart(Restart::Transient)
+            .shutdown(fast_shutdown),
         )
-        .child(ChildSpec::new("keeper", |ctx| async move {
-            ctx.token.cancelled().await;
-            Ok(())
-        }))
+        .child(
+            ChildSpec::new("keeper", |ctx| async move {
+                ctx.token.cancelled().await;
+                Ok(())
+            })
+            .shutdown(fast_shutdown),
+        )
         .build()
         .expect("valid supervisor");
 
@@ -322,7 +331,7 @@ async fn remove_child_completes_promptly_during_restart_backoff() {
     assert_eq!(common::recv_event(&mut starts_rx).await, 0);
 
     loop {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::ChildRestartScheduled { id, delay, .. } if id == "removable" => {
                 assert!(
                     delay >= std::time::Duration::from_secs(1),
@@ -341,7 +350,7 @@ async fn remove_child_completes_promptly_during_restart_backoff() {
 
     let mut saw_removed = false;
     while !saw_removed {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::ChildRemoved { id } if id == "removable" => {
                 saw_removed = true;
             }
@@ -359,21 +368,4 @@ async fn remove_child_completes_promptly_during_restart_backoff() {
     handle.shutdown();
     let exit = handle.wait().await.expect("shutdown should succeed");
     assert!(matches!(exit, SupervisorExit::Shutdown));
-}
-
-async fn recv_supervisor_event(
-    events: &mut broadcast::Receiver<SupervisorEvent>,
-) -> SupervisorEvent {
-    match timeout(common::EVENT_TIMEOUT, events.recv())
-        .await
-        .expect("timed out waiting for supervisor event")
-    {
-        Ok(event) => event,
-        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-            panic!("lagged while reading supervisor events: skipped {skipped}");
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-            panic!("supervisor event stream closed unexpectedly");
-        }
-    }
 }

@@ -69,6 +69,7 @@ impl ChildSpec {
         }
     }
 
+    #[must_use]
     pub fn restart(self, restart: Restart) -> Self {
         let mut inner = Arc::unwrap_or_clone(self.inner);
         inner.restart = restart;
@@ -77,6 +78,7 @@ impl ChildSpec {
         }
     }
 
+    #[must_use]
     pub fn shutdown(self, policy: ShutdownPolicy) -> Self {
         let mut inner = Arc::unwrap_or_clone(self.inner);
         inner.shutdown_policy = policy;
@@ -85,6 +87,7 @@ impl ChildSpec {
         }
     }
 
+    #[must_use]
     pub fn restart_intensity(self, intensity: RestartIntensity) -> Self {
         let mut inner = Arc::unwrap_or_clone(self.inner);
         inner.restart_intensity = Some(intensity);

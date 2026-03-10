@@ -12,7 +12,10 @@ pub struct SupervisorBuilder {
     strategy: Strategy,
     restart_intensity: RestartIntensity,
     children: Vec<ChildSpec>,
+    event_channel_capacity: usize,
 }
+
+const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 impl Default for SupervisorBuilder {
     fn default() -> Self {
@@ -26,6 +29,7 @@ impl SupervisorBuilder {
             strategy: Strategy::default(),
             restart_intensity: RestartIntensity::default(),
             children: Vec::new(),
+            event_channel_capacity: DEFAULT_EVENT_CHANNEL_CAPACITY,
         }
     }
 
@@ -47,6 +51,12 @@ impl SupervisorBuilder {
         self
     }
 
+    #[must_use]
+    pub fn event_channel_capacity(mut self, capacity: usize) -> Self {
+        self.event_channel_capacity = capacity;
+        self
+    }
+
     pub fn build(self) -> Result<Supervisor, BuildError> {
         if self.children.is_empty() {
             return Err(BuildError::EmptyChildren);
@@ -56,6 +66,9 @@ impl SupervisorBuilder {
 
         let mut ids = HashSet::new();
         for child in &self.children {
+            if child.id().is_empty() {
+                return Err(BuildError::InvalidConfig("child id must not be empty"));
+            }
             if let Some(restart_intensity) = child.restart_intensity_override() {
                 restart_intensity.validate()?;
             }
@@ -72,6 +85,7 @@ impl SupervisorBuilder {
                 .into_iter()
                 .map(|child| Arc::clone(&child.inner))
                 .collect(),
+            event_channel_capacity: self.event_channel_capacity,
         }))
     }
 }

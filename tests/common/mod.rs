@@ -9,8 +9,11 @@ use std::{
     time::Duration,
 };
 
-use tokio::{sync::mpsc, time::timeout};
-use tokio_supervisor::BoxError;
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::timeout,
+};
+use tokio_supervisor::{BoxError, SupervisorEvent};
 
 pub const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const QUIET_TIMEOUT: Duration = Duration::from_millis(150);
@@ -73,5 +76,22 @@ pub struct LiveGuard(Arc<AtomicBool>);
 impl Drop for LiveGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+pub async fn recv_supervisor_event(
+    events: &mut broadcast::Receiver<SupervisorEvent>,
+) -> SupervisorEvent {
+    match timeout(EVENT_TIMEOUT, events.recv())
+        .await
+        .expect("timed out waiting for supervisor event")
+    {
+        Ok(event) => event,
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            panic!("lagged while reading supervisor events: skipped {skipped}");
+        }
+        Err(broadcast::error::RecvError::Closed) => {
+            panic!("supervisor event stream closed unexpectedly");
+        }
     }
 }

@@ -126,6 +126,16 @@ fn invalid_child_restart_intensity_is_rejected() {
 }
 
 #[test]
+fn empty_child_id_is_rejected() {
+    let err = SupervisorBuilder::new()
+        .child(ChildSpec::new("", |_| async { Ok(()) }))
+        .build()
+        .expect_err("empty child id must be rejected");
+
+    assert!(matches!(err, BuildError::InvalidConfig(_)));
+}
+
+#[test]
 fn valid_configuration_builds() {
     let supervisor = SupervisorBuilder::new()
         .child(ChildSpec::new("worker", |_| async { Ok(()) }))

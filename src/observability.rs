@@ -444,6 +444,7 @@ mod tests {
         time::Duration,
     };
 
+    #[cfg(feature = "metrics")]
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use tracing::Level;
     use tracing_subscriber::{

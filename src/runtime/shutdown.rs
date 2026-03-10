@@ -19,8 +19,8 @@ impl SupervisorRuntime {
     pub(crate) async fn shutdown_all(&mut self) -> Result<SupervisorExit, SupervisorError> {
         let span = info_span!(
             "shutdown",
-            supervisor_name = %self.observability.supervisor_name(),
-            supervisor_path = %self.observability.supervisor_path(),
+            supervisor_name = %self.meta.observability.supervisor_name(),
+            supervisor_path = %self.meta.observability.supervisor_path(),
         );
 
         async {
@@ -101,23 +101,17 @@ impl SupervisorRuntime {
             }
 
             if !self.join_set.is_empty() && matches!(reason, DrainReason::Shutdown) {
-                self.observability.record_shutdown_timeout("shutdown", None);
+                self.meta
+                    .observability
+                    .record_shutdown_timeout("shutdown", None);
             }
         }
 
         let timed_out = cooperative_timeout_names(&self.children);
         if !timed_out.is_empty() {
-            abort_matching_children(&self.children, |child| {
-                matches!(
-                    child.runtime.spec.shutdown_policy.mode,
-                    ShutdownMode::Cooperative
-                ) || matches!(
-                    child.runtime.spec.shutdown_policy.mode,
-                    ShutdownMode::CooperativeThenAbort | ShutdownMode::Abort
-                )
-            });
+            abort_matching_children(&self.children, |_| true);
             self.drain_join_set(reason).await?;
-            self.observability.record_shutdown_duration(
+            self.meta.observability.record_shutdown_duration(
                 shutdown_operation(reason),
                 started_at.elapsed(),
                 None,
@@ -128,11 +122,11 @@ impl SupervisorRuntime {
         abort_matching_children(&self.children, |child| {
             matches!(
                 child.runtime.spec.shutdown_policy.mode,
-                ShutdownMode::CooperativeThenAbort | ShutdownMode::Abort
+                ShutdownMode::CooperativeThenAbort
             )
         });
         let result = self.drain_join_set(reason).await;
-        self.observability.record_shutdown_duration(
+        self.meta.observability.record_shutdown_duration(
             shutdown_operation(reason),
             started_at.elapsed(),
             None,

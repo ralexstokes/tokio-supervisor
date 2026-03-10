@@ -3,10 +3,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use tokio::{
-    sync::{broadcast, mpsc},
-    time::timeout,
-};
+use tokio::sync::mpsc;
 use tokio_supervisor::{
     ChildSpec, ControlError, EventPathSegment, ExitStatusView, Restart, SupervisorBuilder,
     SupervisorEvent, SupervisorExit,
@@ -159,7 +156,7 @@ async fn dynamically_added_nested_supervisor_can_be_removed() {
         && saw_remove_requested
         && saw_removed)
     {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::Nested {
                 id,
                 generation,
@@ -233,7 +230,7 @@ async fn root_handle_can_add_and_remove_children_inside_nested_supervisor() {
 
     let mut saw_nested_supervisor_started = false;
     while !saw_nested_supervisor_started {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::Nested {
                 id,
                 generation,
@@ -280,7 +277,7 @@ async fn root_handle_can_add_and_remove_children_inside_nested_supervisor() {
     let mut saw_nested_removed = false;
 
     while !(saw_nested_dynamic_started && saw_nested_remove_requested && saw_nested_removed) {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::Nested {
                 id,
                 generation,
@@ -347,7 +344,7 @@ async fn parent_event_stream_includes_forwarded_nested_events() {
     let mut saw_nested_leaf_exit = false;
 
     loop {
-        let event = recv_supervisor_event(&mut events).await;
+        let event = common::recv_supervisor_event(&mut events).await;
         match event {
             SupervisorEvent::Nested {
                 id,
@@ -419,7 +416,7 @@ async fn nested_events_preserve_the_full_tree_path() {
     assert!(matches!(exit, SupervisorExit::Completed));
 
     loop {
-        let event = recv_supervisor_event(&mut events).await;
+        let event = common::recv_supervisor_event(&mut events).await;
         if let SupervisorEvent::Nested { .. } = &event
             && matches!(event.leaf(), SupervisorEvent::ChildStarted { id, generation: 0 } if id == "leaf")
         {
@@ -498,21 +495,4 @@ async fn removing_nested_supervisor_unregisters_its_control_endpoint() {
     handle.shutdown();
     let exit = handle.wait().await.expect("shutdown should succeed");
     assert!(matches!(exit, SupervisorExit::Shutdown));
-}
-
-async fn recv_supervisor_event(
-    events: &mut broadcast::Receiver<SupervisorEvent>,
-) -> SupervisorEvent {
-    match timeout(common::EVENT_TIMEOUT, events.recv())
-        .await
-        .expect("timed out waiting for supervisor event")
-    {
-        Ok(event) => event,
-        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-            panic!("lagged while reading supervisor events: skipped {skipped}");
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-            panic!("supervisor event stream closed unexpectedly");
-        }
-    }
 }

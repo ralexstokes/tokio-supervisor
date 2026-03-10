@@ -4,12 +4,12 @@ use std::sync::{
 };
 
 use tokio::{
-    sync::{Barrier, Notify, broadcast, mpsc},
+    sync::{Barrier, Notify, mpsc},
     time::{Duration, timeout},
 };
 use tokio_supervisor::{
-    BackoffPolicy, ChildSpec, Restart, RestartIntensity, Strategy, SupervisorBuilder,
-    SupervisorEvent, SupervisorExit,
+    BackoffPolicy, ChildSpec, Restart, RestartIntensity, ShutdownMode, ShutdownPolicy, Strategy,
+    SupervisorBuilder, SupervisorEvent, SupervisorExit,
 };
 
 mod common;
@@ -201,6 +201,73 @@ async fn one_for_all_does_not_overlap_old_and_new_generations() {
 }
 
 #[tokio::test]
+async fn one_for_all_restarts_after_aborting_stubborn_cooperative_then_abort_peer() {
+    let release_failure = Arc::new(Notify::new());
+    let trigger_attempts = Arc::new(AtomicUsize::new(0));
+    let peer_live_flag = common::LiveFlag::new();
+
+    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
+
+    let release_failure_for_child = release_failure.clone();
+    let trigger = ChildSpec::new("trigger", move |ctx| {
+        let release_failure = release_failure_for_child.clone();
+        let trigger_attempts = trigger_attempts.clone();
+        async move {
+            if trigger_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                release_failure.notified().await;
+                return Err(common::test_error("restart group"));
+            }
+
+            ctx.token.cancelled().await;
+            Ok(())
+        }
+    })
+    .restart(Restart::Transient)
+    .shutdown(ShutdownPolicy {
+        grace: common::SHORT_GRACE,
+        mode: ShutdownMode::CooperativeThenAbort,
+    });
+
+    let peer_live_flag_for_child = peer_live_flag.clone();
+    let peer = ChildSpec::new("stubborn-peer", move |ctx| {
+        let peer_live_flag = peer_live_flag_for_child.clone();
+        let peer_tx = peer_tx.clone();
+        async move {
+            let _guard = peer_live_flag.guard();
+            peer_tx.send(ctx.generation).expect("test receiver dropped");
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    })
+    .restart(Restart::Permanent)
+    .shutdown(ShutdownPolicy {
+        grace: common::SHORT_GRACE,
+        mode: ShutdownMode::CooperativeThenAbort,
+    });
+
+    let supervisor = SupervisorBuilder::new()
+        .strategy(Strategy::OneForAll)
+        .child(trigger)
+        .child(peer)
+        .build()
+        .expect("valid supervisor");
+
+    let handle = supervisor.spawn();
+
+    assert_eq!(common::recv_event(&mut peer_rx).await, 0);
+    release_failure.notify_one();
+    assert_eq!(common::recv_event(&mut peer_rx).await, 1);
+
+    handle.shutdown();
+    let exit = handle.wait().await.expect("shutdown should succeed");
+    assert!(matches!(exit, SupervisorExit::Shutdown));
+    assert!(
+        !peer_live_flag.is_live(),
+        "stubborn peer should be dropped before wait resolves"
+    );
+}
+
+#[tokio::test]
 async fn drained_old_generation_failure_does_not_poison_later_completed_exit() {
     let release_failure = Arc::new(Notify::new());
     let finish_generation_one = Arc::new(Barrier::new(3));
@@ -383,7 +450,7 @@ async fn group_restart_scheduled_precedes_child_restart_events() {
     let mut saw_peer_restart = false;
 
     while !(saw_trigger_restart && saw_peer_restart) {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::ChildExited { id, generation, .. }
                 if id == "trigger" && generation == 0 =>
             {
@@ -527,7 +594,7 @@ async fn rapid_failures_during_group_restart_do_not_schedule_a_second_group_rest
     let mut saw_peer_restart = false;
 
     while !(saw_trigger_restart && saw_peer_restart) {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::GroupRestartScheduled { .. } => {
                 group_restart_scheduled += 1;
             }
@@ -557,21 +624,4 @@ async fn rapid_failures_during_group_restart_do_not_schedule_a_second_group_rest
     handle.shutdown();
     let exit = handle.wait().await.expect("shutdown should succeed");
     assert!(matches!(exit, SupervisorExit::Shutdown));
-}
-
-async fn recv_supervisor_event(
-    events: &mut broadcast::Receiver<SupervisorEvent>,
-) -> SupervisorEvent {
-    match timeout(common::EVENT_TIMEOUT, events.recv())
-        .await
-        .expect("timed out waiting for supervisor event")
-    {
-        Ok(event) => event,
-        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-            panic!("lagged while reading supervisor events: skipped {skipped}");
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-            panic!("supervisor event stream closed unexpectedly");
-        }
-    }
 }

@@ -4,8 +4,8 @@ use std::sync::{
 };
 
 use tokio::{
-    sync::{broadcast, mpsc},
-    time::{Duration, sleep, timeout},
+    sync::mpsc,
+    time::{Duration, sleep},
 };
 use tokio_supervisor::{
     BackoffPolicy, ChildSpec, ControlError, Restart, RestartIntensity, ShutdownMode,
@@ -180,6 +180,77 @@ async fn cooperative_shutdown_times_out_with_stuck_child_name() {
 }
 
 #[tokio::test]
+async fn mixed_shutdown_only_reports_pure_cooperative_children() {
+    let cooperative_live_flag = common::LiveFlag::new();
+    let aborting_live_flag = common::LiveFlag::new();
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+
+    let started_tx_for_aborting = started_tx.clone();
+    let aborting_live_flag_for_child = aborting_live_flag.clone();
+    let started_tx_for_cooperative = started_tx.clone();
+    let cooperative_live_flag_for_child = cooperative_live_flag.clone();
+    let supervisor = SupervisorBuilder::new()
+        .child(
+            ChildSpec::new("cooperative-then-abort", move |_ctx| {
+                let started_tx = started_tx_for_aborting.clone();
+                let live_flag = aborting_live_flag_for_child.clone();
+                async move {
+                    let _guard = live_flag.guard();
+                    started_tx.send(()).expect("test receiver dropped");
+                    loop {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            })
+            .shutdown(ShutdownPolicy {
+                grace: common::SHORT_GRACE,
+                mode: ShutdownMode::CooperativeThenAbort,
+            }),
+        )
+        .child(
+            ChildSpec::new("cooperative", move |_ctx| {
+                let started_tx = started_tx_for_cooperative.clone();
+                let live_flag = cooperative_live_flag_for_child.clone();
+                async move {
+                    let _guard = live_flag.guard();
+                    started_tx.send(()).expect("test receiver dropped");
+                    loop {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            })
+            .shutdown(ShutdownPolicy {
+                grace: common::SHORT_GRACE,
+                mode: ShutdownMode::Cooperative,
+            }),
+        )
+        .build()
+        .expect("valid supervisor");
+
+    let handle = supervisor.spawn();
+    common::recv_n(&mut started_rx, 2).await;
+
+    handle.shutdown();
+
+    let err = handle
+        .wait()
+        .await
+        .expect_err("mixed shutdown should still report cooperative timeouts");
+    assert_eq!(
+        err,
+        SupervisorError::ShutdownTimedOut("cooperative".to_owned())
+    );
+    assert!(
+        !cooperative_live_flag.is_live(),
+        "timed-out cooperative child should be aborted before wait resolves"
+    );
+    assert!(
+        !aborting_live_flag.is_live(),
+        "cooperative-then-abort child should also be aborted before wait resolves"
+    );
+}
+
+#[tokio::test]
 async fn cooperative_remove_child_times_out_with_stuck_child_name() {
     let live_flag = common::LiveFlag::new();
     let (started_tx, mut started_rx) = mpsc::unbounded_channel();
@@ -290,7 +361,7 @@ async fn shutdown_preempts_zero_delay_restart() {
     let mut events = handle.subscribe();
 
     loop {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::ChildRestartScheduled { delay, .. } => {
                 assert!(delay.is_zero(), "test requires zero-delay restart");
                 handle.shutdown();
@@ -304,7 +375,7 @@ async fn shutdown_preempts_zero_delay_restart() {
     }
 
     loop {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::SupervisorStopping => break,
             SupervisorEvent::ChildRestarted { .. } => {
                 panic!("child restarted after shutdown was requested");
@@ -358,7 +429,7 @@ async fn shutdown_preempts_delayed_restart_in_cooperative_mode() {
     let mut events = handle.subscribe();
 
     loop {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::ChildRestartScheduled { id, delay, .. } if id == "flaky" => {
                 assert!(
                     delay >= Duration::from_millis(200),
@@ -375,7 +446,7 @@ async fn shutdown_preempts_delayed_restart_in_cooperative_mode() {
     }
 
     loop {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::SupervisorStopping => break,
             SupervisorEvent::ChildRestarted { id, .. } if id == "flaky" => {
                 panic!("child restarted after shutdown was requested");
@@ -393,21 +464,4 @@ async fn shutdown_preempts_delayed_restart_in_cooperative_mode() {
         saw_cancel.load(Ordering::SeqCst),
         "cooperative child should observe shutdown cancellation"
     );
-}
-
-async fn recv_supervisor_event(
-    events: &mut broadcast::Receiver<SupervisorEvent>,
-) -> SupervisorEvent {
-    match timeout(common::EVENT_TIMEOUT, events.recv())
-        .await
-        .expect("timed out waiting for supervisor event")
-    {
-        Ok(event) => event,
-        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-            panic!("lagged while reading supervisor events: skipped {skipped}");
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-            panic!("supervisor event stream closed unexpectedly");
-        }
-    }
 }

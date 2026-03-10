@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use tokio::{
-    sync::{broadcast, mpsc},
+    sync::mpsc,
     time::{Duration, sleep, timeout},
 };
 use tokio_supervisor::{
@@ -255,7 +255,7 @@ async fn restart_events_follow_exit_schedule_start_restart_order() {
     let mut saw_restart = false;
 
     while !saw_restart {
-        match recv_supervisor_event(&mut events).await {
+        match common::recv_supervisor_event(&mut events).await {
             SupervisorEvent::ChildExited { id, generation, .. }
                 if id == "flaky" && generation == 0 =>
             {
@@ -294,21 +294,4 @@ async fn restart_events_follow_exit_schedule_start_restart_order() {
     handle.shutdown();
     let exit = handle.wait().await.expect("shutdown should succeed");
     assert!(matches!(exit, SupervisorExit::Shutdown));
-}
-
-async fn recv_supervisor_event(
-    events: &mut broadcast::Receiver<SupervisorEvent>,
-) -> SupervisorEvent {
-    match timeout(common::EVENT_TIMEOUT, events.recv())
-        .await
-        .expect("timed out waiting for supervisor event")
-    {
-        Ok(event) => event,
-        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-            panic!("lagged while reading supervisor events: skipped {skipped}");
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-            panic!("supervisor event stream closed unexpectedly");
-        }
-    }
 }

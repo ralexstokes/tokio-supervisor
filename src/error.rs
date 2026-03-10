@@ -48,3 +48,13 @@ pub enum SupervisorExit {
     Completed,
     Failed,
 }
+
+impl std::fmt::Display for SupervisorExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shutdown => f.write_str("shutdown"),
+            Self::Completed => f.write_str("completed"),
+            Self::Failed => f.write_str("failed"),
+        }
+    }
+}

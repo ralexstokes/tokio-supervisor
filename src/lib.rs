@@ -76,7 +76,7 @@ mod supervisor;
 
 pub use builder::SupervisorBuilder;
 pub use child::{BoxError, ChildResult, ChildSpec};
-pub use context::ChildContext;
+pub use context::{ChildContext, SupervisorToken};
 pub use error::{BuildError, ControlError, SupervisorError, SupervisorExit};
 pub use event::{EventPathSegment, ExitStatusView, SupervisorEvent};
 pub use handle::SupervisorHandle;

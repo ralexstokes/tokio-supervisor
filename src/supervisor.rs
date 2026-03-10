@@ -34,6 +34,7 @@ pub(crate) struct SupervisorConfig {
     pub(crate) strategy: Strategy,
     pub(crate) restart_intensity: RestartIntensity,
     pub(crate) children: Vec<Arc<ChildSpecInner>>,
+    pub(crate) event_channel_capacity: usize,
 }
 
 impl Supervisor {
@@ -43,7 +44,7 @@ impl Supervisor {
 
     pub async fn run(self) -> Result<SupervisorExit, SupervisorError> {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (events_tx, _) = broadcast::channel(256);
+        let (events_tx, _) = broadcast::channel(self.config.event_channel_capacity);
         let (_command_tx, command_rx) = mpsc::unbounded_channel();
         let (snapshots_tx, _) = watch::channel(initial_snapshot(&self.config));
         self.run_with_channels(
@@ -69,7 +70,7 @@ impl Supervisor {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (done_tx, done_rx) = watch::channel(None);
-        let (events_tx, _) = broadcast::channel(256);
+        let (events_tx, _) = broadcast::channel(self.config.event_channel_capacity);
         let (snapshots_tx, snapshots_rx) = watch::channel(initial_snapshot(&self.config));
         let task_done_tx = done_tx.clone();
         let task_events_tx = events_tx.clone();
@@ -231,7 +232,7 @@ fn initial_snapshot(config: &SupervisorConfig) -> SupervisorSnapshot {
             .map(|spec| ChildSnapshot {
                 id: spec.id.clone(),
                 generation: 0,
-                state: ChildStateView::Stopped,
+                state: ChildStateView::Starting,
                 membership: ChildMembershipView::Active,
                 last_exit: None,
                 restart_count: 0,

@@ -26,18 +26,18 @@ pub(crate) struct ControlEndpoint {
 }
 
 impl ControlEndpoint {
-    async fn add_child(self, child: ChildSpec) -> Result<(), ControlError> {
+    async fn add_child(&self, child: ChildSpec) -> Result<(), ControlError> {
         self.send(|reply| SupervisorCommand::AddChild { child, reply })
             .await
     }
 
-    async fn remove_child(self, id: String) -> Result<(), ControlError> {
+    async fn remove_child(&self, id: String) -> Result<(), ControlError> {
         self.send(|reply| SupervisorCommand::RemoveChild { id, reply })
             .await
     }
 
     async fn send(
-        self,
+        &self,
         command: impl FnOnce(oneshot::Sender<Result<(), ControlError>>) -> SupervisorCommand,
     ) -> Result<(), ControlError> {
         let (reply_tx, reply_rx) = oneshot::channel();

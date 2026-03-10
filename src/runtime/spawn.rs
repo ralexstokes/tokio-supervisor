@@ -1,5 +1,5 @@
 use crate::{
-    context::ChildContext,
+    context::{ChildContext, SupervisorToken},
     error::SupervisorError,
     event::{NestedEventForwarder, SupervisorEvent, with_nested_event_forwarder},
     handle::{NestedControlScope, with_nested_control_scope},
@@ -44,7 +44,7 @@ impl SupervisorRuntime {
                 id: child_id.clone(),
                 generation,
                 token: child_token,
-                supervisor_token: self.group_token.clone(),
+                supervisor_token: SupervisorToken::new(self.group_token.clone()),
             };
             let future = child.spec.factory.make(ctx);
 
@@ -57,10 +57,11 @@ impl SupervisorRuntime {
             child_id.clone(),
             generation,
         );
-        let control_scope = NestedControlScope::new(self.registry.clone(), self.child_path(key));
-        let child_path = self.observability.child_path(&child_id);
-        let supervisor_name = self.observability.supervisor_name().to_owned();
-        let supervisor_path = self.observability.supervisor_path().to_owned();
+        let control_scope =
+            NestedControlScope::new(self.meta.registry.clone(), self.child_path(key));
+        let child_path = self.meta.observability.child_path(&child_id);
+        let supervisor_name = self.meta.observability.supervisor_name().to_owned();
+        let supervisor_path = self.meta.observability.supervisor_path().to_owned();
         let child_span = info_span!(
             "child",
             supervisor_name = %supervisor_name,

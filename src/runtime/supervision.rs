@@ -88,16 +88,22 @@ impl ChildEntry {
     }
 }
 
-pub(crate) struct SupervisorRuntime {
+/// Read-only configuration and identity, fixed at construction time.
+pub(crate) struct RuntimeMeta {
     pub(crate) strategy: Strategy,
     pub(crate) default_restart_intensity: RestartIntensity,
+    pub(crate) registry: Arc<NestedControlRegistry>,
+    pub(crate) path_prefix: Vec<String>,
+    pub(crate) observability: SupervisorObservability,
+}
+
+pub(crate) struct SupervisorRuntime {
+    pub(crate) meta: RuntimeMeta,
     pub(crate) state: SupervisorState,
     pub(crate) group_token: CancellationToken,
     pub(crate) join_set: JoinSet<ChildEnvelope>,
     pub(crate) children: Vec<ChildEntry>,
     pub(crate) children_by_id: HashMap<String, ChildKey>,
-    pub(crate) registry: Arc<NestedControlRegistry>,
-    pub(crate) path_prefix: Vec<String>,
     pub(crate) events: broadcast::Sender<SupervisorEvent>,
     pub(crate) snapshots: watch::Sender<SupervisorSnapshot>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
@@ -108,7 +114,6 @@ pub(crate) struct SupervisorRuntime {
     pub(crate) task_map: HashMap<Id, TaskMeta>,
     pub(crate) pending_exit: Option<Result<SupervisorExit, SupervisorError>>,
     pub(crate) last_exit: Option<SupervisorExit>,
-    pub(crate) observability: SupervisorObservability,
 }
 
 impl SupervisorRuntime {
@@ -140,15 +145,18 @@ impl SupervisorRuntime {
         let (nested_snapshot_tx, nested_snapshot_rx) = mpsc::unbounded_channel();
 
         Self {
-            strategy: config.strategy,
-            default_restart_intensity,
+            meta: RuntimeMeta {
+                strategy: config.strategy,
+                default_restart_intensity,
+                registry,
+                path_prefix,
+                observability,
+            },
             state: SupervisorState::Running,
             group_token: CancellationToken::new(),
             join_set: JoinSet::new(),
             children,
             children_by_id,
-            registry,
-            path_prefix,
             events,
             snapshots,
             shutdown_rx,
@@ -159,7 +167,6 @@ impl SupervisorRuntime {
             task_map: HashMap::new(),
             pending_exit: None,
             last_exit: None,
-            observability,
         }
     }
 
@@ -249,6 +256,10 @@ impl SupervisorRuntime {
             return Err(ControlError::SupervisorStopping);
         }
 
+        if child.id().is_empty() {
+            return Err(ControlError::InvalidConfig("child id must not be empty"));
+        }
+
         if let Some(restart_intensity) = child.restart_intensity_override() {
             restart_intensity
                 .validate()
@@ -261,12 +272,12 @@ impl SupervisorRuntime {
         }
 
         let key = self.children.len();
-        let formatted_path = format_child_path(&self.path_prefix, &id);
+        let formatted_path = format_child_path(&self.meta.path_prefix, &id);
         self.children.push(ChildEntry::new(
             id.clone(),
             formatted_path,
             Arc::clone(&child.inner),
-            self.default_restart_intensity,
+            self.meta.default_restart_intensity,
         ));
         self.children_by_id.insert(id.clone(), key);
 
@@ -373,7 +384,7 @@ impl SupervisorRuntime {
 
         loop {
             if self.children[key].membership == MembershipState::Removed {
-                self.observability.record_shutdown_duration(
+                self.meta.observability.record_shutdown_duration(
                     "remove_child",
                     started_at.elapsed(),
                     Some(&child_id),
@@ -392,7 +403,7 @@ impl SupervisorRuntime {
                     }
                     _ = tokio::time::sleep_until(deadline_at) => {
                         self.abort_child(key);
-                        self.observability
+                        self.meta.observability
                             .record_shutdown_timeout("remove_child", Some(&child_id));
                         if timeout_is_error {
                             removal_error = Some(ControlError::ShutdownTimedOut(child_id.clone()));
@@ -447,8 +458,7 @@ impl SupervisorRuntime {
             .await
             .map_err(map_supervisor_error_to_control)?;
 
-        if let Some(result) = self.pending_exit.take() {
-            self.pending_exit = Some(result);
+        if self.pending_exit.is_some() {
             return Err(ControlError::SupervisorStopping);
         }
 
@@ -475,7 +485,7 @@ impl SupervisorRuntime {
     }
 
     pub(crate) fn child_path(&self, key: ChildKey) -> Vec<String> {
-        let mut path = self.path_prefix.clone();
+        let mut path = self.meta.path_prefix.clone();
         path.push(self.children[key].id.clone());
         path
     }
@@ -516,7 +526,7 @@ impl SupervisorRuntime {
         let restart_policy = self.children[classified.key].runtime.spec.restart;
 
         if restart_policy.should_restart(classified.status.is_failure()) {
-            match self.strategy {
+            match self.meta.strategy {
                 Strategy::OneForOne => {
                     self.handle_one_for_one_restart(classified.key, classified.generation)
                         .await?
@@ -755,7 +765,8 @@ impl SupervisorRuntime {
         let child_path = event_child_id(&event)
             .and_then(|id| self.children_by_id.get(id))
             .map(|&key| self.children[key].formatted_path.as_str());
-        self.observability
+        self.meta
+            .observability
             .emit_event(&event, self.running_child_count(), child_path);
         let _ = self.events.send(event);
     }
@@ -772,7 +783,7 @@ impl SupervisorRuntime {
                 SupervisorState::Stopped => SupervisorStateView::Stopped,
             },
             last_exit: self.last_exit,
-            strategy: self.strategy,
+            strategy: self.meta.strategy,
             children: self
                 .children
                 .iter()
