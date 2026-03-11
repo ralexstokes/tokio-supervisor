@@ -20,14 +20,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }))
         .actor(ActorSpec::native("generator", |ctx| async move {
             loop {
-                tokio::select! {
-                    _ = ctx.shutdown_token().cancelled() => {
-                        return Ok(());
-                    }
-                    _ = sleep(Duration::from_millis(50)) => {
-                       ctx.send("worker", Envelope::from_static(b"some work")).await?;
-                    }
-                }
+                ctx.send("worker", Envelope::from_static(b"some work"))
+                    .await?;
+                sleep(Duration::from_millis(50)).await;
             }
         }))
         .actor(ActorSpec::native("worker", {
@@ -49,7 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let ingress = graph.ingress("requests").expect("ingress exists");
     let supervised_graph = ChildSpec::new("actor-graph", {
-        let graph = graph.clone();
+        let graph = graph;
         move |ctx| {
             let graph = graph.clone();
             async move {
