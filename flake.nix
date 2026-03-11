@@ -1,5 +1,5 @@
 {
-  description = "tokio-supervisor development environment";
+  description = "tokio-otp development environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

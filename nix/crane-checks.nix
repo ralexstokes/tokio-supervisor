@@ -26,16 +26,20 @@ let
       );
   };
   commonArgs = {
+    pname = "tokio-otp";
     src = cargoSrc;
     strictDeps = true;
+    version = "0.1.0";
   };
   cargoArtifacts = craneLibStable.buildDepsOnly commonArgs;
 in
 {
-  cargo-fmt = craneLibNightly.cargoFmt {
-    src = cargoSrc;
-    cargoExtraArgs = "--all";
-  };
+  cargo-fmt = craneLibNightly.cargoFmt (
+    commonArgs
+    // {
+      cargoExtraArgs = "--all";
+    }
+  );
 
   cargo-clippy = craneLibNightly.cargoClippy (
     commonArgs

@@ -1,7 +1,8 @@
-# tokio-supervisor
+# tokio-otp
 
-Structured task supervision for tokio.
-Inspired by Erlang/OTP-style supervision trees.
+Crates for the tokio ecosystem that are inspired by Erlang/OTP.
+* `tokio-supervisor` - structured task supervision
+* `tokio-actor` - actor abstraction supporting both native Rust and WASM implementations.
 
 ## Getting started
 
