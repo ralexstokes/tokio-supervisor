@@ -4,6 +4,7 @@ Set of crates for Erlang/OTP-like functionality in the `tokio` ecosystem.
 
 Currently:
 * `tokio-supervisor` - structured task supervision
+* `tokio-actor` - graphs of communicating tasks
 
 ## Development
 
