@@ -1,6 +1,6 @@
 [workspace]
-default-members = ["crates/tokio-supervisor"]
-members = ["crates/tokio-supervisor"]
+default-members = ["crates/tokio-supervisor", "crates/tokio-actor"]
+members = ["crates/tokio-supervisor", "crates/tokio-actor"]
 resolver = "3"
 
 [workspace.metadata]

@@ -1,0 +1,151 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, atomic::AtomicBool},
+};
+
+use crate::{
+    actor::ActorSpec,
+    error::BuildError,
+    graph::{Graph, GraphInner, IngressDefinition},
+    ingress::IngressBinding,
+};
+
+/// Builder for constructing a validated actor graph.
+///
+/// Graphs are static in this first iteration: actors, links, and ingress
+/// points are all defined up front before calling [`build`](Self::build).
+pub struct GraphBuilder {
+    actors: Vec<ActorSpec>,
+    links: Vec<(String, String)>,
+    ingresses: Vec<(String, String)>,
+    mailbox_capacity: usize,
+}
+
+const DEFAULT_MAILBOX_CAPACITY: usize = 64;
+
+impl Default for GraphBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GraphBuilder {
+    /// Creates a new builder with no actors and a default mailbox capacity of
+    /// 64 messages per actor.
+    pub fn new() -> Self {
+        Self {
+            actors: Vec::new(),
+            links: Vec::new(),
+            ingresses: Vec::new(),
+            mailbox_capacity: DEFAULT_MAILBOX_CAPACITY,
+        }
+    }
+
+    /// Appends an actor to the graph.
+    #[must_use]
+    pub fn actor(mut self, actor: ActorSpec) -> Self {
+        self.actors.push(actor);
+        self
+    }
+
+    /// Adds a directed link from `from` to `to`.
+    ///
+    /// Actors only receive [`ActorRef`](crate::ActorRef) handles for peers
+    /// that are linked from the actor.
+    #[must_use]
+    pub fn link(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.links.push((from.into(), to.into()));
+        self
+    }
+
+    /// Adds a named stable ingress point that routes external messages to the
+    /// target actor.
+    #[must_use]
+    pub fn ingress(mut self, name: impl Into<String>, target_actor: impl Into<String>) -> Self {
+        self.ingresses.push((name.into(), target_actor.into()));
+        self
+    }
+
+    /// Sets the bounded mailbox capacity used for every actor in the graph.
+    #[must_use]
+    pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
+        self.mailbox_capacity = capacity;
+        self
+    }
+
+    /// Validates the graph and returns an immutable [`Graph`].
+    pub fn build(self) -> Result<Graph, BuildError> {
+        if self.actors.is_empty() {
+            return Err(BuildError::EmptyActors);
+        }
+
+        if self.mailbox_capacity == 0 {
+            return Err(BuildError::InvalidConfig(
+                "mailbox capacity must be non-zero",
+            ));
+        }
+
+        let mut actor_ids = HashSet::new();
+        let mut actors = Vec::with_capacity(self.actors.len());
+        let mut links = HashMap::new();
+
+        for actor in self.actors {
+            if actor.id().is_empty() {
+                return Err(BuildError::InvalidConfig("actor id must not be empty"));
+            }
+            if !actor_ids.insert(actor.id().to_owned()) {
+                return Err(BuildError::DuplicateActorId(actor.id().to_owned()));
+            }
+            links.insert(actor.id().to_owned(), Vec::new());
+            actors.push(Arc::clone(&actor.inner));
+        }
+
+        for (from, to) in self.links {
+            if !actor_ids.contains(&from) {
+                return Err(BuildError::UnknownLinkSource { actor: from });
+            }
+            if !actor_ids.contains(&to) {
+                return Err(BuildError::UnknownLinkTarget { from, actor: to });
+            }
+            let outgoing = links
+                .get_mut(&from)
+                .ok_or_else(|| BuildError::UnknownLinkSource {
+                    actor: from.clone(),
+                })?;
+            outgoing.push(to);
+        }
+
+        let mut ingress_names = HashSet::new();
+        let mut ingresses = HashMap::new();
+        for (name, target) in self.ingresses {
+            if name.is_empty() {
+                return Err(BuildError::InvalidConfig("ingress name must not be empty"));
+            }
+            if !ingress_names.insert(name.clone()) {
+                return Err(BuildError::DuplicateIngressName(name));
+            }
+            if !actor_ids.contains(&target) {
+                return Err(BuildError::UnknownIngressTarget {
+                    ingress: name,
+                    actor: target,
+                });
+            }
+
+            ingresses.insert(
+                name,
+                IngressDefinition {
+                    target_actor: target,
+                    binding: Arc::new(IngressBinding::default()),
+                },
+            );
+        }
+
+        Ok(Graph::new(GraphInner {
+            actors,
+            links,
+            mailbox_capacity: self.mailbox_capacity,
+            ingresses,
+            running: AtomicBool::new(false),
+        }))
+    }
+}

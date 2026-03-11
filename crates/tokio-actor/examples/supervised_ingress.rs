@@ -1,0 +1,95 @@
+use std::{error::Error, time::Duration};
+
+use tokio::{
+    sync::mpsc,
+    time::{sleep, timeout},
+};
+use tokio_actor::{ActorSpec, Envelope, GraphBuilder, IngressError};
+use tokio_supervisor::{ChildSpec, SupervisorBuilder};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+
+    let graph = GraphBuilder::new()
+        .actor(ActorSpec::native("frontend", |mut ctx| async move {
+            while let Some(envelope) = ctx.recv().await {
+                ctx.send("worker", envelope).await?;
+            }
+            Ok(())
+        }))
+        .actor(ActorSpec::native("generator", |ctx| async move {
+            loop {
+                tokio::select! {
+                    _ = ctx.shutdown_token().cancelled() => {
+                        return Ok(());
+                    }
+                    _ = sleep(Duration::from_millis(50)) => {
+                       ctx.send("worker", Envelope::from_static(b"some work")).await?;
+                    }
+                }
+            }
+        }))
+        .actor(ActorSpec::native("worker", {
+            let observed_tx = observed_tx;
+            move |mut ctx| {
+                let observed_tx = observed_tx.clone();
+                async move {
+                    while let Some(envelope) = ctx.recv().await {
+                        observed_tx.send(envelope).expect("receiver alive");
+                    }
+                    Ok(())
+                }
+            }
+        }))
+        .link("frontend", "worker")
+        .link("generator", "worker")
+        .ingress("requests", "frontend")
+        .build()?;
+
+    let ingress = graph.ingress("requests").expect("ingress exists");
+    let supervised_graph = ChildSpec::new("actor-graph", {
+        let graph = graph.clone();
+        move |ctx| {
+            let graph = graph.clone();
+            async move {
+                graph
+                    .run_until(ctx.token.cancelled())
+                    .await
+                    .map_err(Into::into)
+            }
+        }
+    });
+
+    let supervisor = SupervisorBuilder::new().child(supervised_graph).build()?;
+    let handle = supervisor.spawn();
+
+    send_when_ready(&ingress, Envelope::from_static(b"hello")).await?;
+
+    // observe the stream of work for some time...
+    let _ = timeout(Duration::from_millis(300), async {
+        while let Some(envelope) = observed_rx.recv().await {
+            println!(
+                "worker saw: {:?}",
+                str::from_utf8(envelope.as_slice()).expect("some message")
+            );
+        }
+    })
+    .await;
+
+    handle.shutdown_and_wait().await?;
+    Ok(())
+}
+
+async fn send_when_ready(
+    ingress: &tokio_actor::IngressHandle,
+    envelope: Envelope,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        match ingress.send(envelope.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(IngressError::NotRunning { .. }) => sleep(Duration::from_millis(10)).await,
+            Err(err) => return Err(Box::new(err)),
+        }
+    }
+}

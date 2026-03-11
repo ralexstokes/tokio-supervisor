@@ -1,0 +1,102 @@
+//! Static actor graphs for Tokio, intended to compose with `tokio-supervisor`.
+//!
+//! `tokio-actor` focuses on two responsibilities only:
+//!
+//! - defining a graph of actors and directed links between them
+//! - moving byte envelopes between actors and external ingress points
+//!
+//! Internal restart policy and supervision are intentionally out of scope.
+//! When an actor fails, panics, or exits before shutdown, the whole graph run
+//! fails. That makes a graph instance a good fit for hosting as a single child
+//! in a `tokio-supervisor` tree.
+//!
+//! # Core concepts
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`GraphBuilder`] | Constructs and validates the actor graph. |
+//! | [`Graph`] | Immutable, cloneable graph spec that can be rerun. |
+//! | [`ActorSpec`] | Native Rust actor definition. |
+//! | [`ActorContext`] | Mailbox, peers, and shutdown token visible to one actor. |
+//! | [`ActorRef`] | Cloneable mailbox sender for a linked peer. |
+//! | [`IngressHandle`] | Stable external sender that survives graph reruns. |
+//! | [`Envelope`] | Opaque byte payload passed through the graph. |
+//!
+//! # Stable ingress handles
+//!
+//! Ingress handles are bound to a named entrypoint in the graph instead of a
+//! single actor runtime. When the same [`Graph`] is rerun, the handle is
+//! rebound to the current mailbox of its target actor.
+//!
+//! This is especially useful when the graph is hosted inside a supervised
+//! child task and can be restarted by `tokio-supervisor`.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use tokio_actor::{ActorSpec, Envelope, GraphBuilder, IngressError};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let graph = GraphBuilder::new()
+//!     .actor(ActorSpec::native("frontend", |mut ctx| async move {
+//!         while let Some(envelope) = ctx.recv().await {
+//!             ctx.send("worker", envelope).await?;
+//!         }
+//!         Ok(())
+//!     }))
+//!     .actor(ActorSpec::native("worker", |mut ctx| async move {
+//!         while let Some(envelope) = ctx.recv().await {
+//!             println!("{:?}", envelope.as_slice());
+//!         }
+//!         Ok(())
+//!     }))
+//!     .link("frontend", "worker")
+//!     .ingress("requests", "frontend")
+//!     .build()
+//!     .expect("valid graph");
+//!
+//! let ingress = graph.ingress("requests").expect("ingress exists");
+//! let stop = tokio_util::sync::CancellationToken::new();
+//! let task = tokio::spawn({
+//!     let graph = graph.clone();
+//!     let stop = stop.clone();
+//!     async move { graph.run_until(stop.cancelled()).await }
+//! });
+//!
+//! loop {
+//!     match ingress.send(Envelope::from_static(b"hello")).await {
+//!         Ok(()) => break,
+//!         Err(IngressError::NotRunning { .. }) => tokio::task::yield_now().await,
+//!         Err(err) => panic!("unexpected ingress error: {err}"),
+//!     }
+//! }
+//!
+//! stop.cancel();
+//! task.await.expect("graph task joined").expect("graph stopped cleanly");
+//! # Ok(())
+//! # }
+//! ```
+
+mod actor;
+mod builder;
+mod context;
+mod envelope;
+mod error;
+mod graph;
+mod ingress;
+
+pub mod prelude {
+    pub use crate::{
+        ActorContext, ActorRef, ActorResult, ActorSpec, BuildError, Envelope, Graph, GraphBuilder,
+        GraphError, IngressError, IngressHandle, SendError,
+    };
+}
+
+pub use actor::{ActorResult, ActorSpec, BoxError};
+pub use builder::GraphBuilder;
+pub use context::{ActorContext, ActorRef};
+pub use envelope::Envelope;
+pub use error::{BuildError, GraphError, IngressError, SendError};
+pub use graph::Graph;
+pub use ingress::IngressHandle;

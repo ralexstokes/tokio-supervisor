@@ -933,6 +933,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-actor"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+ "tokio",
+ "tokio-supervisor",
+ "tokio-util",
+]
+
+[[package]]
 name = "tokio-macros"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
