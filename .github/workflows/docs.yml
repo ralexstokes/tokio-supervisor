@@ -1,0 +1,46 @@
+name: docs
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+
+      - name: Build docs
+        run: |
+          nix develop --command cargo doc --workspace --no-deps --all-features
+          echo '<meta http-equiv="refresh" content="0; url=tokio_supervisor/index.html">' > target/doc/index.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
