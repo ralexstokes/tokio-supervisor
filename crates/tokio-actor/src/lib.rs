@@ -79,6 +79,7 @@
 //! ```
 
 mod actor;
+mod blocking;
 mod builder;
 mod context;
 mod envelope;
@@ -88,12 +89,18 @@ mod ingress;
 
 pub mod prelude {
     pub use crate::{
-        ActorContext, ActorRef, ActorResult, ActorSpec, BuildError, Envelope, Graph, GraphBuilder,
-        GraphError, IngressError, IngressHandle, SendError,
+        ActorContext, ActorRef, ActorResult, ActorSpec, BlockingContext, BlockingHandle,
+        BlockingOperationError, BlockingOptions, BlockingTaskError, BlockingTaskFailure,
+        BlockingTaskId, BuildError, Envelope, Graph, GraphBuilder, GraphError, IngressError,
+        IngressHandle, SendError, SpawnBlockingError,
     };
 }
 
 pub use actor::{ActorResult, ActorSpec, BoxError};
+pub use blocking::{
+    BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions, BlockingTaskError,
+    BlockingTaskFailure, BlockingTaskId, SpawnBlockingError,
+};
 pub use builder::GraphBuilder;
 pub use context::{ActorContext, ActorRef};
 pub use envelope::Envelope;

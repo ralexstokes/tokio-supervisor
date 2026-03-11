@@ -42,6 +42,16 @@ impl MailboxRef {
             },
         })
     }
+
+    pub(crate) fn blocking_send(&self, envelope: Envelope) -> Result<(), MailboxError> {
+        self.sender
+            .blocking_send(envelope)
+            .map_err(|err| match err {
+                mpsc::error::SendError(_) => MailboxError::MailboxClosed {
+                    actor_id: self.actor_id.clone(),
+                },
+            })
+    }
 }
 
 pub(crate) struct IngressBinding {
@@ -104,6 +114,19 @@ impl IngressHandle {
             })
     }
 
+    fn map_mailbox_error(&self, err: MailboxError) -> IngressError {
+        match err {
+            MailboxError::MailboxFull { .. } => IngressError::MailboxFull {
+                ingress: self.name.clone(),
+                actor_id: self.actor_id.clone(),
+            },
+            MailboxError::MailboxClosed { .. } => IngressError::MailboxClosed {
+                ingress: self.name.clone(),
+                actor_id: self.actor_id.clone(),
+            },
+        }
+    }
+
     /// Returns the ingress name.
     pub fn name(&self) -> &str {
         &self.name
@@ -121,32 +144,16 @@ impl IngressHandle {
         mailbox
             .send(envelope.into())
             .await
-            .map_err(|err| match err {
-                MailboxError::MailboxFull { .. } => IngressError::MailboxFull {
-                    ingress: self.name.clone(),
-                    actor_id: self.actor_id.clone(),
-                },
-                MailboxError::MailboxClosed { .. } => IngressError::MailboxClosed {
-                    ingress: self.name.clone(),
-                    actor_id: self.actor_id.clone(),
-                },
-            })
+            .map_err(|err| self.map_mailbox_error(err))
     }
 
     /// Attempts to send an envelope through the ingress without waiting.
     pub fn try_send(&self, envelope: impl Into<Envelope>) -> Result<(), IngressError> {
         let mailbox = self.current_mailbox()?;
 
-        mailbox.try_send(envelope.into()).map_err(|err| match err {
-            MailboxError::MailboxFull { .. } => IngressError::MailboxFull {
-                ingress: self.name.clone(),
-                actor_id: self.actor_id.clone(),
-            },
-            MailboxError::MailboxClosed { .. } => IngressError::MailboxClosed {
-                ingress: self.name.clone(),
-                actor_id: self.actor_id.clone(),
-            },
-        })
+        mailbox
+            .try_send(envelope.into())
+            .map_err(|err| self.map_mailbox_error(err))
     }
 }
 

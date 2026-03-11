@@ -1,6 +1,7 @@
 use std::{
     io,
     sync::{Arc, Mutex},
+    thread,
     time::Duration,
 };
 
@@ -8,7 +9,10 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::{sleep, timeout},
 };
-use tokio_actor::{ActorSpec, BuildError, Envelope, GraphBuilder, GraphError, IngressError};
+use tokio_actor::{
+    ActorSpec, BlockingOptions, BlockingTaskFailure, BuildError, Envelope, GraphBuilder,
+    GraphError, IngressError,
+};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -246,6 +250,96 @@ async fn graph_can_only_run_once_at_a_time() {
         .await
         .expect("first run joined")
         .expect("first run stopped cleanly");
+}
+
+#[tokio::test]
+async fn dropped_blocking_task_failures_fail_the_actor() {
+    let graph = GraphBuilder::new()
+        .actor(ActorSpec::native("worker", |mut ctx| async move {
+            ctx.spawn_blocking(BlockingOptions::named("boom"), |_job| {
+                Err(io::Error::other("boom").into())
+            })
+            .expect("blocking task spawned");
+
+            while ctx.recv().await.is_some() {}
+            Ok(())
+        }))
+        .build()
+        .expect("valid graph");
+
+    let result = graph
+        .run_until(tokio::time::sleep(Duration::from_secs(1)))
+        .await;
+    match result {
+        Err(GraphError::ActorFailed { actor_id, source }) => {
+            assert_eq!(actor_id, "worker");
+            let failure = source
+                .downcast_ref::<BlockingTaskFailure>()
+                .expect("blocking failure is attached");
+            assert_eq!(failure.task_name(), Some("boom"));
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn graph_waits_for_dropped_blocking_tasks_to_cleanup() {
+    let (started_tx, started_rx) = oneshot::channel();
+    let (cleaned_tx, cleaned_rx) = oneshot::channel();
+    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    let cleaned_tx = Arc::new(Mutex::new(Some(cleaned_tx)));
+
+    let graph = GraphBuilder::new()
+        .actor(ActorSpec::native("worker", {
+            let started_tx = Arc::clone(&started_tx);
+            let cleaned_tx = Arc::clone(&cleaned_tx);
+            move |mut ctx| {
+                let started_tx = Arc::clone(&started_tx);
+                let cleaned_tx = Arc::clone(&cleaned_tx);
+                async move {
+                    ctx.spawn_blocking(BlockingOptions::named("cleanup"), move |job| {
+                        if let Some(tx) = started_tx.lock().expect("mutex not poisoned").take() {
+                            let _ = tx.send(());
+                        }
+
+                        loop {
+                            if job.checkpoint().is_err() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+
+                        if let Some(tx) = cleaned_tx.lock().expect("mutex not poisoned").take() {
+                            let _ = tx.send(());
+                        }
+                        Ok(())
+                    })
+                    .expect("blocking task spawned");
+
+                    while ctx.recv().await.is_some() {}
+                    Ok(())
+                }
+            }
+        }))
+        .build()
+        .expect("valid graph");
+
+    let stop = CancellationToken::new();
+    let task = tokio::spawn({
+        let graph = graph.clone();
+        let stop = stop.clone();
+        async move { graph.run_until(stop.cancelled()).await }
+    });
+
+    started_rx.await.expect("blocking task started");
+    stop.cancel();
+    task.await
+        .expect("graph task joined")
+        .expect("graph stopped cleanly");
+    timeout(Duration::from_secs(1), cleaned_rx)
+        .await
+        .expect("cleanup finished before graph returned")
+        .expect("cleanup signal received");
 }
 
 async fn send_when_ready(ingress: &tokio_actor::IngressHandle, envelope: Envelope) {

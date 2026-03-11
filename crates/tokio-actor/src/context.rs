@@ -4,10 +4,21 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    blocking::{
+        BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions, BlockingSpawner,
+        SpawnBlockingError,
+    },
     envelope::Envelope,
     error::SendError,
     ingress::{MailboxError, MailboxRef},
 };
+
+fn map_mailbox_error(err: MailboxError) -> SendError {
+    match err {
+        MailboxError::MailboxFull { actor_id } => SendError::MailboxFull { actor_id },
+        MailboxError::MailboxClosed { actor_id } => SendError::MailboxClosed { actor_id },
+    }
+}
 
 /// Cloneable sender for an actor mailbox.
 #[derive(Clone, Debug)]
@@ -30,20 +41,21 @@ impl ActorRef {
         self.mailbox
             .send(envelope.into())
             .await
-            .map_err(|err| match err {
-                MailboxError::MailboxFull { actor_id } => SendError::MailboxFull { actor_id },
-                MailboxError::MailboxClosed { actor_id } => SendError::MailboxClosed { actor_id },
-            })
+            .map_err(map_mailbox_error)
     }
 
     /// Attempts to send an envelope without waiting for mailbox capacity.
     pub fn try_send(&self, envelope: impl Into<Envelope>) -> Result<(), SendError> {
         self.mailbox
             .try_send(envelope.into())
-            .map_err(|err| match err {
-                MailboxError::MailboxFull { actor_id } => SendError::MailboxFull { actor_id },
-                MailboxError::MailboxClosed { actor_id } => SendError::MailboxClosed { actor_id },
-            })
+            .map_err(map_mailbox_error)
+    }
+
+    /// Sends an envelope from blocking code, waiting for mailbox capacity.
+    pub fn blocking_send(&self, envelope: impl Into<Envelope>) -> Result<(), SendError> {
+        self.mailbox
+            .blocking_send(envelope.into())
+            .map_err(map_mailbox_error)
     }
 }
 
@@ -52,7 +64,9 @@ pub struct ActorContext {
     pub(crate) id: String,
     pub(crate) mailbox: mpsc::Receiver<Envelope>,
     pub(crate) peers: HashMap<String, ActorRef>,
+    pub(crate) myself: ActorRef,
     pub(crate) shutdown: CancellationToken,
+    pub(crate) blocking: BlockingSpawner,
 }
 
 impl ActorContext {
@@ -95,6 +109,11 @@ impl ActorContext {
         self.peers.get(actor_id).cloned()
     }
 
+    /// Returns a sender targeting this actor's own mailbox.
+    pub fn myself(&self) -> ActorRef {
+        self.myself.clone()
+    }
+
     /// Sends an envelope to a linked peer.
     pub async fn send(
         &self,
@@ -109,5 +128,30 @@ impl ActorContext {
     pub fn try_send(&self, actor_id: &str, envelope: impl Into<Envelope>) -> Result<(), SendError> {
         let peer = self.linked_peer(actor_id)?;
         peer.try_send(envelope)
+    }
+
+    /// Spawns tracked blocking work owned by this actor.
+    pub fn spawn_blocking<F>(
+        &self,
+        options: BlockingOptions,
+        f: F,
+    ) -> Result<BlockingHandle, SpawnBlockingError>
+    where
+        F: FnOnce(BlockingContext) -> Result<(), BlockingOperationError> + Send + 'static,
+    {
+        self.blocking.spawn_blocking(options, f)
+    }
+
+    /// Runs tracked blocking work and waits for it to finish.
+    pub async fn run_blocking<F>(
+        &self,
+        options: BlockingOptions,
+        f: F,
+    ) -> Result<(), crate::blocking::BlockingTaskError>
+    where
+        F: FnOnce(BlockingContext) -> Result<(), BlockingOperationError> + Send + 'static,
+    {
+        let handle = self.spawn_blocking(options, f)?;
+        handle.wait().await
     }
 }

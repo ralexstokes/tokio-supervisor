@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     actor::{ActorResult, ActorSpecInner},
+    blocking::{BlockingRuntime, BlockingRuntimeEvent},
     context::{ActorContext, ActorRef},
     envelope::Envelope,
     error::GraphError,
@@ -255,17 +256,53 @@ impl GraphRuntime {
                 .ok_or_else(|| GraphError::InvalidState {
                     detail: format!("actor `{}` is missing its mailbox receiver", actor.id),
                 })?;
+            let myself = mailboxes
+                .get(&actor.id)
+                .cloned()
+                .map(ActorRef::from_mailbox)
+                .ok_or_else(|| GraphError::InvalidState {
+                    detail: format!("actor `{}` is missing its own mailbox sender", actor.id),
+                })?;
+            let actor_shutdown = self.shutdown.child_token();
+            let mut blocking =
+                BlockingRuntime::new(actor.id.clone(), myself.clone(), actor_shutdown.clone());
             let ctx = ActorContext {
                 id: actor.id.clone(),
                 mailbox,
                 peers,
-                shutdown: self.shutdown.clone(),
+                myself,
+                shutdown: actor_shutdown.clone(),
+                blocking: blocking.spawner(),
             };
             let actor_id = actor.id.clone();
             let factory = Arc::clone(&actor.factory);
 
             let abort_handle = self.join_set.spawn(async move {
-                let result = factory.make(ctx).await;
+                let actor_future = factory.make(ctx);
+                tokio::pin!(actor_future);
+
+                let mut first_blocking_failure = None;
+                let result = loop {
+                    tokio::select! {
+                        result = &mut actor_future => break result,
+                        maybe_event = blocking.next_event() => {
+                            match maybe_event {
+                                Some(BlockingRuntimeEvent::Completed { task_id, failure }) => {
+                                    if let Some(failure) = failure {
+                                        actor_shutdown.cancel();
+                                        first_blocking_failure.get_or_insert(failure);
+                                    }
+
+                                    if let Some(failure) = blocking.reap_task(task_id).await {
+                                        first_blocking_failure.get_or_insert(failure);
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                };
+                let result = blocking.finish(result, first_blocking_failure).await;
                 ActorTaskExit { actor_id, result }
             });
             self.task_ids.insert(abort_handle.id(), actor.id.clone());
