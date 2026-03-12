@@ -1,6 +1,6 @@
-use std::{error::Error, future::pending, io, time::Duration};
+use std::{error::Error, future::pending, io, sync::Arc, time::Duration};
 
-use tokio::{task::JoinHandle, time::timeout};
+use tokio::{sync::Notify, task::JoinHandle, time::timeout};
 use tokio_actor::{ActorContext, ActorSpec, Graph, GraphBuilder, GraphError};
 use tokio_util::sync::CancellationToken;
 
@@ -27,21 +27,24 @@ async fn stop_graph(
 }
 
 async fn demonstrate_already_running() -> Result<(), Box<dyn Error>> {
+    let started = Arc::new(Notify::new());
     let graph = GraphBuilder::new()
-        .actor(ActorSpec::from_actor(
-            "worker",
-            |mut ctx: ActorContext| async move {
-                while ctx.recv().await.is_some() {}
-                Ok(())
-            },
-        ))
-        .ingress("requests", "worker")
+        .actor(ActorSpec::from_actor("worker", {
+            let started = Arc::clone(&started);
+            move |mut ctx: ActorContext| {
+                let started = Arc::clone(&started);
+                async move {
+                    started.notify_one();
+                    while ctx.recv().await.is_some() {}
+                    Ok(())
+                }
+            }
+        }))
         .build()?;
 
-    let mut ingress = graph.ingress("requests").expect("ingress exists");
     let (stop, task) = start_graph(&graph);
 
-    ingress.wait_for_binding().await;
+    started.notified().await;
     let err = graph
         .run_until(async {})
         .await

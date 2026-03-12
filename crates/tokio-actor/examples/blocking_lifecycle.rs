@@ -1,18 +1,20 @@
 use std::{error::Error, io, thread, time::Duration};
 
-use tokio::{sync::oneshot, time::sleep};
+use std::sync::Arc;
+
+use tokio::{sync::Notify, time::sleep};
 use tokio_actor::{ActorContext, ActorSpec, BlockingOptions, BlockingTaskError, GraphBuilder};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let (done_tx, done_rx) = oneshot::channel();
+    let done = Arc::new(Notify::new());
 
     let graph = GraphBuilder::new()
         .actor(ActorSpec::from_actor("worker", {
-            let done_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(done_tx)));
+            let done = Arc::clone(&done);
             move |mut ctx: ActorContext| {
-                let done_tx = std::sync::Arc::clone(&done_tx);
+                let done = Arc::clone(&done);
                 async move {
                     while let Some(envelope) = ctx.recv().await {
                         match envelope.as_slice() {
@@ -58,10 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     Err(other) => panic!("unexpected blocking error: {other}"),
                                 }
 
-                                if let Some(tx) = done_tx.lock().expect("mutex not poisoned").take()
-                                {
-                                    let _ = tx.send(());
-                                }
+                                done.notify_one();
                             }
                             _ => {}
                         }
@@ -85,7 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ingress.send("handle failure locally").await?;
     ingress.send("cancel blocking task").await?;
 
-    done_rx.await.expect("worker finished the lifecycle demo");
+    done.notified().await;
 
     stop.cancel();
     task.await??;
