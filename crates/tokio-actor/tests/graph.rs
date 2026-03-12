@@ -10,8 +10,8 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_actor::{
-    ActorSpec, BlockingOptions, BlockingTaskFailure, BuildError, Envelope, GraphBuilder,
-    GraphError, IngressError,
+    Actor, ActorContext, ActorResult, ActorSpec, BlockingOptions, BlockingTaskFailure, BuildError,
+    Envelope, GraphBuilder, GraphError, IngressError,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +38,71 @@ async fn delivers_messages_across_linked_actors() {
                 }
             }
         }))
+        .link("frontend", "worker")
+        .ingress("requests", "frontend")
+        .build()
+        .expect("valid graph");
+
+    let ingress = graph.ingress("requests").expect("ingress exists");
+    let stop = CancellationToken::new();
+    let task = tokio::spawn({
+        let graph = graph.clone();
+        let stop = stop.clone();
+        async move { graph.run_until(stop.cancelled()).await }
+    });
+
+    send_when_ready(&ingress, Envelope::from_static(b"hello")).await;
+
+    let envelope = timeout(Duration::from_secs(1), observed_rx.recv())
+        .await
+        .expect("message arrived in time")
+        .expect("message observed");
+    assert_eq!(envelope.as_slice(), b"hello");
+
+    stop.cancel();
+    task.await
+        .expect("graph task joined")
+        .expect("graph stopped cleanly");
+}
+
+#[derive(Clone)]
+struct ForwardingActor;
+
+impl Actor for ForwardingActor {
+    async fn run(&self, mut ctx: ActorContext) -> ActorResult {
+        while let Some(envelope) = ctx.recv().await {
+            ctx.send("worker", envelope).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ObservingActor {
+    observed_tx: mpsc::UnboundedSender<Envelope>,
+}
+
+impl Actor for ObservingActor {
+    async fn run(&self, mut ctx: ActorContext) -> ActorResult {
+        while let Some(envelope) = ctx.recv().await {
+            self.observed_tx.send(envelope).expect("receiver alive");
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn delivers_messages_with_trait_actors() {
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+
+    let graph = GraphBuilder::new()
+        .actor(ActorSpec::from_actor("frontend", ForwardingActor))
+        .actor(ActorSpec::from_actor(
+            "worker",
+            ObservingActor {
+                observed_tx: observed_tx.clone(),
+            },
+        ))
         .link("frontend", "worker")
         .ingress("requests", "frontend")
         .build()

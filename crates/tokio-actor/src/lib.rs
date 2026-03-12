@@ -77,6 +77,31 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! For larger actor implementations, you can define a reusable actor type and
+//! pass it to [`ActorSpec::from_actor`]:
+//!
+//! ```no_run
+//! use tokio_actor::{Actor, ActorContext, ActorResult, ActorSpec, GraphBuilder};
+//!
+//! #[derive(Clone)]
+//! struct Worker;
+//!
+//! impl Actor for Worker {
+//!     async fn run(&self, mut ctx: ActorContext) -> ActorResult {
+//!         while let Some(envelope) = ctx.recv().await {
+//!             println!("{:?}", envelope.as_slice());
+//!         }
+//!         Ok(())
+//!     }
+//! }
+//!
+//! let graph = GraphBuilder::new()
+//!     .actor(ActorSpec::from_actor("worker", Worker))
+//!     .build()
+//!     .expect("valid graph");
+//! # let _ = graph;
+//! ```
 
 mod actor;
 mod blocking;
@@ -89,14 +114,14 @@ mod ingress;
 
 pub mod prelude {
     pub use crate::{
-        ActorContext, ActorRef, ActorResult, ActorSpec, BlockingContext, BlockingHandle,
+        Actor, ActorContext, ActorRef, ActorResult, ActorSpec, BlockingContext, BlockingHandle,
         BlockingOperationError, BlockingOptions, BlockingTaskError, BlockingTaskFailure,
         BlockingTaskId, BuildError, Envelope, Graph, GraphBuilder, GraphError, IngressError,
         IngressHandle, SendError, SpawnBlockingError,
     };
 }
 
-pub use actor::{ActorResult, ActorSpec, BoxError};
+pub use actor::{Actor, ActorResult, ActorSpec, BoxError};
 pub use blocking::{
     BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions, BlockingTaskError,
     BlockingTaskFailure, BlockingTaskId, SpawnBlockingError,
