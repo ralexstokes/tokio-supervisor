@@ -13,11 +13,23 @@ pub(crate) type ActorFuture = Pin<Box<dyn Future<Output = ActorResult> + Send + 
 /// Async actor interface for reusable actor implementations.
 ///
 /// Implementors can use `async fn run(&self, ctx: ActorContext) -> ActorResult`
-/// in their trait impls. When used with [`ActorSpec::from_actor`], the actor
-/// value is cloned for each graph run before `run` is invoked.
-pub trait Actor: Send + Sync + 'static {
+/// in their trait impls. Async closures that implement
+/// `Fn(ActorContext) -> impl Future<Output = ActorResult>` also implement
+/// [`Actor`], so [`ActorSpec::from_actor`] is the only constructor needed for
+/// both named actor types and inline closure actors.
+pub trait Actor: Clone + Send + Sync + 'static {
     /// Runs the actor until it finishes or graph shutdown is requested.
     fn run(&self, ctx: ActorContext) -> impl Future<Output = ActorResult> + Send;
+}
+
+impl<F, Fut> Actor for F
+where
+    F: Fn(ActorContext) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = ActorResult> + Send,
+{
+    fn run(&self, ctx: ActorContext) -> impl Future<Output = ActorResult> + Send {
+        (self)(ctx)
+    }
 }
 
 /// Specification for a native Rust actor within a graph.
@@ -41,27 +53,13 @@ pub(crate) trait ActorFactory: Send + Sync + 'static {
     fn make(&self, ctx: ActorContext) -> ActorFuture;
 }
 
-struct ClosureFactory<F> {
-    f: F,
-}
-
-impl<F, Fut> ActorFactory for ClosureFactory<F>
-where
-    F: Fn(ActorContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ActorResult> + Send + 'static,
-{
-    fn make(&self, ctx: ActorContext) -> ActorFuture {
-        Box::pin((self.f)(ctx))
-    }
-}
-
 struct InstanceFactory<A> {
     actor: A,
 }
 
 impl<A> ActorFactory for InstanceFactory<A>
 where
-    A: Actor + Clone,
+    A: Actor,
 {
     fn make(&self, ctx: ActorContext) -> ActorFuture {
         let actor = self.actor.clone();
@@ -69,47 +67,23 @@ where
     }
 }
 
-fn make_actor_factory<F, Fut>(f: F) -> Arc<dyn ActorFactory>
-where
-    F: Fn(ActorContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = ActorResult> + Send + 'static,
-{
-    Arc::new(ClosureFactory { f })
-}
-
 fn make_instance_factory<A>(actor: A) -> Arc<dyn ActorFactory>
 where
-    A: Actor + Clone,
+    A: Actor,
 {
     Arc::new(InstanceFactory { actor })
 }
 
 impl ActorSpec {
-    /// Creates a new native Rust actor specification from an async closure.
-    ///
-    /// `id` must be unique within the graph built by
-    /// [`GraphBuilder`](crate::GraphBuilder).
-    pub fn native<F, Fut>(id: impl Into<String>, f: F) -> Self
-    where
-        F: Fn(ActorContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ActorResult> + Send + 'static,
-    {
-        Self {
-            inner: Arc::new(ActorSpecInner {
-                id: id.into(),
-                factory: make_actor_factory(f),
-            }),
-        }
-    }
-
     /// Creates a new native Rust actor specification from an [`Actor`]
     /// implementation.
     ///
     /// The actor value is cloned for each graph run before [`Actor::run`] is
-    /// invoked, so actor types used here must implement [`Clone`].
+    /// invoked. Inline async closures work here too because they implement
+    /// [`Actor`] automatically when they are cloneable.
     pub fn from_actor<A>(id: impl Into<String>, actor: A) -> Self
     where
-        A: Actor + Clone,
+        A: Actor,
     {
         Self {
             inner: Arc::new(ActorSpecInner {

@@ -34,18 +34,18 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use tokio_actor::{ActorSpec, Envelope, GraphBuilder, IngressError};
+//! use tokio_actor::{ActorContext, ActorSpec, Envelope, GraphBuilder, IngressError};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let graph = GraphBuilder::new()
-//!     .actor(ActorSpec::native("frontend", |mut ctx| async move {
+//!     .actor(ActorSpec::from_actor("frontend", |mut ctx: ActorContext| async move {
 //!         while let Some(envelope) = ctx.recv().await {
 //!             ctx.send("worker", envelope).await?;
 //!         }
 //!         Ok(())
 //!     }))
-//!     .actor(ActorSpec::native("worker", |mut ctx| async move {
+//!     .actor(ActorSpec::from_actor("worker", |mut ctx: ActorContext| async move {
 //!         while let Some(envelope) = ctx.recv().await {
 //!             println!("{:?}", envelope.as_slice());
 //!         }
