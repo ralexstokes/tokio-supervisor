@@ -32,12 +32,12 @@ where
     }
 }
 
-/// Specification for a native Rust actor within a graph.
+/// Specification for an actor within a graph.
 ///
-/// An `ActorSpec` stores an actor id plus an async factory function that is
-/// invoked each time the enclosing graph is run. The factory receives a fresh
-/// [`ActorContext`] containing the actor's mailbox, linked peers, and shared
-/// shutdown token.
+/// An `ActorSpec` stores an actor id plus a factory that builds a fresh actor
+/// future each time the enclosing graph is run. The factory receives a fresh
+/// [`ActorContext`] containing the actor's mailbox, linked peers, and the
+/// shared shutdown token.
 #[derive(Clone)]
 pub struct ActorSpec {
     pub(crate) inner: Arc<ActorSpecInner>,
@@ -67,16 +67,8 @@ where
     }
 }
 
-fn make_instance_factory<A>(actor: A) -> Arc<dyn ActorFactory>
-where
-    A: Actor,
-{
-    Arc::new(InstanceFactory { actor })
-}
-
 impl ActorSpec {
-    /// Creates a new native Rust actor specification from an [`Actor`]
-    /// implementation.
+    /// Creates a new actor specification from an [`Actor`] implementation.
     ///
     /// The actor value is cloned for each graph run before [`Actor::run`] is
     /// invoked. Inline async closures work here too because they implement
@@ -88,7 +80,7 @@ impl ActorSpec {
         Self {
             inner: Arc::new(ActorSpecInner {
                 id: id.into(),
-                factory: make_instance_factory(actor),
+                factory: Arc::new(InstanceFactory { actor }),
             }),
         }
     }
