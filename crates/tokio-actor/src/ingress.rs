@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 
@@ -54,6 +54,10 @@ impl MailboxRef {
     }
 
     pub(crate) fn actor_id(&self) -> &str {
+        &self.actor_id
+    }
+
+    pub(crate) fn actor_id_ref(&self) -> &Arc<str> {
         &self.actor_id
     }
 
@@ -165,7 +169,7 @@ impl IngressHandle {
     pub async fn send(&self, envelope: impl Into<Envelope>) -> Result<(), IngressError> {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
-        let started_at = Instant::now();
+        let started_at = self.observability.start_message_timing();
 
         let result = match self.current_mailbox() {
             Ok(mailbox) => mailbox
@@ -177,7 +181,7 @@ impl IngressHandle {
         self.observe_send(
             MessageOperation::Send,
             envelope_len,
-            started_at.elapsed(),
+            GraphObservability::finish_message_timing(started_at),
             &result,
         );
         result
@@ -187,7 +191,7 @@ impl IngressHandle {
     pub fn try_send(&self, envelope: impl Into<Envelope>) -> Result<(), IngressError> {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
-        let started_at = Instant::now();
+        let started_at = self.observability.start_message_timing();
 
         let result = match self.current_mailbox() {
             Ok(mailbox) => mailbox
@@ -198,7 +202,7 @@ impl IngressHandle {
         self.observe_send(
             MessageOperation::TrySend,
             envelope_len,
-            started_at.elapsed(),
+            GraphObservability::finish_message_timing(started_at),
             &result,
         );
         result
@@ -220,8 +224,8 @@ impl IngressHandle {
         result: &Result<(), IngressError>,
     ) {
         self.observability.emit_ingress_message(
-            self.name(),
-            self.target(),
+            &self.name,
+            &self.actor_id,
             operation,
             envelope_len,
             duration,

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -44,7 +44,7 @@ impl ActorRef {
     pub async fn send(&self, envelope: impl Into<Envelope>) -> Result<(), SendError> {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
-        let started_at = Instant::now();
+        let started_at = self.observability.start_message_timing();
         let result = self
             .mailbox
             .send(envelope)
@@ -53,7 +53,7 @@ impl ActorRef {
         self.observe_send(
             MessageOperation::Send,
             envelope_len,
-            started_at.elapsed(),
+            GraphObservability::finish_message_timing(started_at),
             &result,
         );
         result
@@ -63,7 +63,7 @@ impl ActorRef {
     pub fn try_send(&self, envelope: impl Into<Envelope>) -> Result<(), SendError> {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
-        let started_at = Instant::now();
+        let started_at = self.observability.start_message_timing();
         let result = self
             .mailbox
             .try_send(envelope)
@@ -71,7 +71,7 @@ impl ActorRef {
         self.observe_send(
             MessageOperation::TrySend,
             envelope_len,
-            started_at.elapsed(),
+            GraphObservability::finish_message_timing(started_at),
             &result,
         );
         result
@@ -85,7 +85,7 @@ impl ActorRef {
     pub fn blocking_send(&self, envelope: impl Into<Envelope>) -> Result<(), SendError> {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
-        let started_at = Instant::now();
+        let started_at = self.observability.start_message_timing();
         let result = self
             .mailbox
             .blocking_send(envelope)
@@ -93,7 +93,7 @@ impl ActorRef {
         self.observe_send(
             MessageOperation::BlockingSend,
             envelope_len,
-            started_at.elapsed(),
+            GraphObservability::finish_message_timing(started_at),
             &result,
         );
         result
@@ -108,7 +108,7 @@ impl ActorRef {
     ) {
         self.observability.emit_actor_message(
             self.source_actor_id.as_deref(),
-            self.id(),
+            self.mailbox.actor_id_ref(),
             operation,
             envelope_len,
             duration,
@@ -179,13 +179,10 @@ impl ActorContext {
     ) -> Result<(), SendError> {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
-        let started_at = Instant::now();
 
         match self.peers.get(actor_id) {
             Some(peer) => peer.send(envelope).await,
-            None => {
-                Err(self.unknown_peer(actor_id, MessageOperation::Send, envelope_len, started_at))
-            }
+            None => Err(self.unknown_peer(actor_id, MessageOperation::Send, envelope_len)),
         }
     }
 
@@ -193,16 +190,10 @@ impl ActorContext {
     pub fn try_send(&self, actor_id: &str, envelope: impl Into<Envelope>) -> Result<(), SendError> {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
-        let started_at = Instant::now();
 
         match self.peers.get(actor_id) {
             Some(peer) => peer.try_send(envelope),
-            None => Err(self.unknown_peer(
-                actor_id,
-                MessageOperation::TrySend,
-                envelope_len,
-                started_at,
-            )),
+            None => Err(self.unknown_peer(actor_id, MessageOperation::TrySend, envelope_len)),
         }
     }
 
@@ -242,20 +233,21 @@ impl ActorContext {
         actor_id: &str,
         operation: MessageOperation,
         envelope_len: usize,
-        started_at: Instant,
     ) -> SendError {
+        let peer_id: Arc<str> = actor_id.into();
+        let started_at = self.observability.start_message_timing();
         self.observability.emit_actor_message(
             Some(self.id()),
-            actor_id,
+            &peer_id,
             operation,
             envelope_len,
-            started_at.elapsed(),
+            GraphObservability::finish_message_timing(started_at),
             Some(SendRejection::UnknownPeer),
         );
 
         SendError::UnknownPeer {
             actor_id: self.id.to_string(),
-            peer_id: actor_id.to_owned(),
+            peer_id: peer_id.to_string(),
         }
     }
 }

@@ -424,22 +424,25 @@ impl GraphRuntime {
                 let actor_id = self
                     .task_ids
                     .remove(&err.id())
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_owned());
+                    .unwrap_or_else(|| Arc::from("<unknown>"));
                 if err.is_panic() {
                     self.inner.observability.emit_actor_exited(
                         &actor_id,
                         ActorExitStatus::Panicked,
                         None,
                     );
-                    Err(GraphError::ActorPanicked { actor_id })
+                    Err(GraphError::ActorPanicked {
+                        actor_id: actor_id.to_string(),
+                    })
                 } else {
                     self.inner.observability.emit_actor_exited(
                         &actor_id,
                         ActorExitStatus::Cancelled,
                         None,
                     );
-                    Err(GraphError::ActorCancelled { actor_id })
+                    Err(GraphError::ActorCancelled {
+                        actor_id: actor_id.to_string(),
+                    })
                 }
             }
         }

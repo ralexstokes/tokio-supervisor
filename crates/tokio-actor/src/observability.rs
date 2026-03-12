@@ -3,11 +3,13 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "metrics")]
-use metrics::{counter, gauge, histogram};
+use metrics::{SharedString, counter, gauge, histogram};
+#[cfg(not(feature = "metrics"))]
+use tracing::Level;
 use tracing::{Span, debug, info, info_span, trace, warn};
 
 use crate::blocking::BlockingTaskId;
@@ -21,6 +23,8 @@ pub(crate) fn anonymous_graph_name() -> Arc<str> {
 #[derive(Clone, Debug)]
 pub(crate) struct GraphObservability {
     graph_name: Arc<str>,
+    #[cfg(feature = "metrics")]
+    graph_label: SharedString,
     running_actors: Arc<AtomicUsize>,
     running_blocking_tasks: Arc<AtomicUsize>,
 }
@@ -28,6 +32,8 @@ pub(crate) struct GraphObservability {
 impl GraphObservability {
     pub(crate) fn new(graph_name: Arc<str>) -> Self {
         Self {
+            #[cfg(feature = "metrics")]
+            graph_label: SharedString::from(Arc::clone(&graph_name)),
             graph_name,
             running_actors: Arc::new(AtomicUsize::new(0)),
             running_blocking_tasks: Arc::new(AtomicUsize::new(0)),
@@ -158,7 +164,7 @@ impl GraphObservability {
         );
     }
 
-    pub(crate) fn emit_actor_started(&self, actor_id: &str) {
+    pub(crate) fn emit_actor_started(&self, actor_id: &Arc<str>) {
         let running = self.running_actors.fetch_add(1, Ordering::AcqRel) + 1;
 
         info!(
@@ -170,10 +176,11 @@ impl GraphObservability {
 
         #[cfg(feature = "metrics")]
         {
+            let actor_label = shared_label(actor_id);
             counter!(
                 "actor_graph.actors.started",
                 "graph" => self.graph_label(),
-                "actor_id" => actor_id.to_owned(),
+                "actor_id" => actor_label,
             )
             .increment(1);
             gauge!("actor_graph.actors.running", "graph" => self.graph_label()).set(running as f64);
@@ -182,7 +189,7 @@ impl GraphObservability {
 
     pub(crate) fn emit_actor_exited(
         &self,
-        actor_id: &str,
+        actor_id: &Arc<str>,
         status: ActorExitStatus,
         error: Option<&str>,
     ) {
@@ -217,10 +224,11 @@ impl GraphObservability {
 
         #[cfg(feature = "metrics")]
         {
+            let actor_label = shared_label(actor_id);
             counter!(
                 "actor_graph.actors.exited",
                 "graph" => self.graph_label(),
-                "actor_id" => actor_id.to_owned(),
+                "actor_id" => actor_label,
                 "status" => status.as_str(),
             )
             .increment(1);
@@ -228,7 +236,7 @@ impl GraphObservability {
         }
     }
 
-    pub(crate) fn emit_ingress_bound(&self, ingress: &str, actor_id: &str) {
+    pub(crate) fn emit_ingress_bound(&self, ingress: &Arc<str>, actor_id: &Arc<str>) {
         info!(
             graph = %self.graph_name,
             ingress = %ingress,
@@ -237,16 +245,20 @@ impl GraphObservability {
         );
 
         #[cfg(feature = "metrics")]
-        gauge!(
-            "actor_graph.ingress.bound",
-            "graph" => self.graph_label(),
-            "ingress" => ingress.to_owned(),
-            "actor_id" => actor_id.to_owned(),
-        )
-        .set(1.0);
+        {
+            let ingress_label = shared_label(ingress);
+            let actor_label = shared_label(actor_id);
+            gauge!(
+                "actor_graph.ingress.bound",
+                "graph" => self.graph_label(),
+                "ingress" => ingress_label,
+                "actor_id" => actor_label,
+            )
+            .set(1.0);
+        }
     }
 
-    pub(crate) fn emit_ingress_cleared(&self, ingress: &str, actor_id: &str) {
+    pub(crate) fn emit_ingress_cleared(&self, ingress: &Arc<str>, actor_id: &Arc<str>) {
         debug!(
             graph = %self.graph_name,
             ingress = %ingress,
@@ -258,8 +270,8 @@ impl GraphObservability {
         gauge!(
             "actor_graph.ingress.bound",
             "graph" => self.graph_label(),
-            "ingress" => ingress.to_owned(),
-            "actor_id" => actor_id.to_owned(),
+            "ingress" => shared_label(ingress),
+            "actor_id" => shared_label(actor_id),
         )
         .set(0.0);
     }
@@ -267,7 +279,7 @@ impl GraphObservability {
     pub(crate) fn emit_actor_message(
         &self,
         source_actor_id: Option<&str>,
-        target_actor_id: &str,
+        target_actor_id: &Arc<str>,
         operation: MessageOperation,
         envelope_len: usize,
         duration: Duration,
@@ -284,11 +296,12 @@ impl GraphObservability {
 
         #[cfg(feature = "metrics")]
         {
+            let target_actor_label = shared_label(target_actor_id);
             match rejection {
                 Some(rejection) => counter!(
                     "actor_graph.messages.rejected",
                     "graph" => self.graph_label(),
-                    "actor_id" => target_actor_id.to_owned(),
+                    "actor_id" => target_actor_label.clone(),
                     "operation" => operation.as_str(),
                     "reason" => rejection.as_str(),
                 )
@@ -296,7 +309,7 @@ impl GraphObservability {
                 None => counter!(
                     "actor_graph.messages.sent",
                     "graph" => self.graph_label(),
-                    "actor_id" => target_actor_id.to_owned(),
+                    "actor_id" => target_actor_label.clone(),
                     "operation" => operation.as_str(),
                 )
                 .increment(1),
@@ -305,7 +318,7 @@ impl GraphObservability {
                 "actor_graph.send.duration",
                 "graph" => self.graph_label(),
                 "source" => "actor",
-                "actor_id" => target_actor_id.to_owned(),
+                "actor_id" => target_actor_label,
                 "operation" => operation.as_str(),
                 "status" => send_status_label(rejection),
             )
@@ -313,7 +326,7 @@ impl GraphObservability {
         }
     }
 
-    pub(crate) fn emit_message_received(&self, actor_id: &str, envelope_len: usize) {
+    pub(crate) fn emit_message_received(&self, actor_id: &Arc<str>, envelope_len: usize) {
         trace!(
             graph = %self.graph_name,
             actor_id = %actor_id,
@@ -325,15 +338,15 @@ impl GraphObservability {
         counter!(
             "actor_graph.messages.received",
             "graph" => self.graph_label(),
-            "actor_id" => actor_id.to_owned(),
+            "actor_id" => shared_label(actor_id),
         )
         .increment(1);
     }
 
     pub(crate) fn emit_ingress_message(
         &self,
-        ingress: &str,
-        actor_id: &str,
+        ingress: &Arc<str>,
+        actor_id: &Arc<str>,
         operation: MessageOperation,
         envelope_len: usize,
         duration: Duration,
@@ -350,12 +363,14 @@ impl GraphObservability {
 
         #[cfg(feature = "metrics")]
         {
+            let ingress_label = shared_label(ingress);
+            let actor_label = shared_label(actor_id);
             match rejection {
                 Some(rejection) => counter!(
                     "actor_graph.ingress.rejected",
                     "graph" => self.graph_label(),
-                    "ingress" => ingress.to_owned(),
-                    "actor_id" => actor_id.to_owned(),
+                    "ingress" => ingress_label.clone(),
+                    "actor_id" => actor_label.clone(),
                     "operation" => operation.as_str(),
                     "reason" => rejection.as_str(),
                 )
@@ -363,8 +378,8 @@ impl GraphObservability {
                 None => counter!(
                     "actor_graph.ingress.sent",
                     "graph" => self.graph_label(),
-                    "ingress" => ingress.to_owned(),
-                    "actor_id" => actor_id.to_owned(),
+                    "ingress" => ingress_label.clone(),
+                    "actor_id" => actor_label.clone(),
                     "operation" => operation.as_str(),
                 )
                 .increment(1),
@@ -373,8 +388,8 @@ impl GraphObservability {
                 "actor_graph.send.duration",
                 "graph" => self.graph_label(),
                 "source" => "ingress",
-                "ingress" => ingress.to_owned(),
-                "actor_id" => actor_id.to_owned(),
+                "ingress" => ingress_label,
+                "actor_id" => actor_label,
                 "operation" => operation.as_str(),
                 "status" => send_status_label(rejection),
             )
@@ -384,7 +399,7 @@ impl GraphObservability {
 
     pub(crate) fn emit_blocking_task_started(
         &self,
-        actor_id: &str,
+        actor_id: &Arc<str>,
         task_id: BlockingTaskId,
         task_name: Option<&str>,
     ) {
@@ -410,10 +425,11 @@ impl GraphObservability {
 
         #[cfg(feature = "metrics")]
         {
+            let actor_label = shared_label(actor_id);
             counter!(
                 "actor_graph.blocking.started",
                 "graph" => self.graph_label(),
-                "actor_id" => actor_id.to_owned(),
+                "actor_id" => actor_label,
             )
             .increment(1);
             gauge!("actor_graph.blocking.running", "graph" => self.graph_label())
@@ -423,7 +439,7 @@ impl GraphObservability {
 
     pub(crate) fn emit_blocking_task_finished(
         &self,
-        actor_id: &str,
+        actor_id: &Arc<str>,
         task_id: BlockingTaskId,
         task_name: Option<&str>,
         status: BlockingTaskStatus,
@@ -498,10 +514,11 @@ impl GraphObservability {
 
         #[cfg(feature = "metrics")]
         {
+            let actor_label = shared_label(actor_id);
             counter!(
                 "actor_graph.blocking.completed",
                 "graph" => self.graph_label(),
-                "actor_id" => actor_id.to_owned(),
+                "actor_id" => actor_label.clone(),
                 "status" => status.as_str(),
             )
             .increment(1);
@@ -510,17 +527,31 @@ impl GraphObservability {
             histogram!(
                 "actor_graph.blocking.duration",
                 "graph" => self.graph_label(),
-                "actor_id" => actor_id.to_owned(),
+                "actor_id" => actor_label,
                 "status" => status.as_str(),
             )
             .record(duration.as_secs_f64());
         }
     }
 
+    #[cfg(feature = "metrics")]
+    pub(crate) fn start_message_timing(&self) -> Option<Instant> {
+        Some(Instant::now())
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    pub(crate) fn start_message_timing(&self) -> Option<Instant> {
+        tracing::event_enabled!(Level::TRACE).then(Instant::now)
+    }
+
+    pub(crate) fn finish_message_timing(started_at: Option<Instant>) -> Duration {
+        started_at.map_or(Duration::ZERO, |started_at| started_at.elapsed())
+    }
+
     fn trace_actor_message(
         &self,
         source_actor_id: Option<&str>,
-        target_actor_id: &str,
+        target_actor_id: &Arc<str>,
         operation: MessageOperation,
         envelope_len: usize,
         duration: Duration,
@@ -568,8 +599,8 @@ impl GraphObservability {
 
     fn trace_ingress_message(
         &self,
-        ingress: &str,
-        actor_id: &str,
+        ingress: &Arc<str>,
+        actor_id: &Arc<str>,
         operation: MessageOperation,
         envelope_len: usize,
         duration: Duration,
@@ -599,9 +630,14 @@ impl GraphObservability {
     }
 
     #[cfg(feature = "metrics")]
-    fn graph_label(&self) -> String {
-        self.graph_name.to_string()
+    fn graph_label(&self) -> SharedString {
+        self.graph_label.clone()
     }
+}
+
+#[cfg(feature = "metrics")]
+fn shared_label(value: &Arc<str>) -> SharedString {
+    SharedString::from(Arc::clone(value))
 }
 
 fn send_status_label(rejection: Option<SendRejection>) -> &'static str {
@@ -754,6 +790,9 @@ mod tests {
     #[test]
     fn tracing_output_covers_graph_actor_ingress_message_and_blocking_events() {
         let observability = GraphObservability::new(Arc::from("orders"));
+        let frontend: Arc<str> = Arc::from("frontend");
+        let worker: Arc<str> = Arc::from("worker");
+        let requests: Arc<str> = Arc::from("requests");
 
         assert_tracing_output(
             || observability.emit_graph_started(2, 1, 64),
@@ -773,7 +812,7 @@ mod tests {
             ],
         );
         assert_tracing_output(
-            || observability.emit_actor_started("frontend"),
+            || observability.emit_actor_started(&frontend),
             &[
                 "actor started",
                 r#""graph":"orders""#,
@@ -781,7 +820,7 @@ mod tests {
             ],
         );
         assert_tracing_output(
-            || observability.emit_actor_exited("frontend", ActorExitStatus::Failed, Some("boom")),
+            || observability.emit_actor_exited(&frontend, ActorExitStatus::Failed, Some("boom")),
             &[
                 "actor exited",
                 r#""actor_id":"frontend""#,
@@ -790,7 +829,7 @@ mod tests {
             ],
         );
         assert_tracing_output(
-            || observability.emit_ingress_bound("requests", "frontend"),
+            || observability.emit_ingress_bound(&requests, &frontend),
             &[
                 "ingress bound",
                 r#""ingress":"requests""#,
@@ -798,7 +837,7 @@ mod tests {
             ],
         );
         assert_tracing_output(
-            || observability.emit_ingress_cleared("requests", "frontend"),
+            || observability.emit_ingress_cleared(&requests, &frontend),
             &[
                 "ingress cleared",
                 r#""ingress":"requests""#,
@@ -809,7 +848,7 @@ mod tests {
             || {
                 observability.emit_actor_message(
                     Some("frontend"),
-                    "worker",
+                    &worker,
                     MessageOperation::Send,
                     5,
                     Duration::from_millis(2),
@@ -826,7 +865,7 @@ mod tests {
             || {
                 observability.emit_actor_message(
                     Some("frontend"),
-                    "worker",
+                    &worker,
                     MessageOperation::TrySend,
                     5,
                     Duration::from_millis(1),
@@ -840,7 +879,7 @@ mod tests {
             ],
         );
         assert_tracing_output(
-            || observability.emit_message_received("worker", 5),
+            || observability.emit_message_received(&worker, 5),
             &[
                 "message received",
                 r#""actor_id":"worker""#,
@@ -850,8 +889,8 @@ mod tests {
         assert_tracing_output(
             || {
                 observability.emit_ingress_message(
-                    "requests",
-                    "frontend",
+                    &requests,
+                    &frontend,
                     MessageOperation::Send,
                     5,
                     Duration::from_millis(3),
@@ -867,8 +906,8 @@ mod tests {
         assert_tracing_output(
             || {
                 observability.emit_ingress_message(
-                    "requests",
-                    "frontend",
+                    &requests,
+                    &frontend,
                     MessageOperation::Send,
                     5,
                     Duration::from_millis(1),
@@ -884,7 +923,7 @@ mod tests {
         assert_tracing_output(
             || {
                 observability.emit_blocking_task_started(
-                    "worker",
+                    &worker,
                     BlockingTaskId::from_u64(7),
                     Some("io"),
                 )
@@ -898,7 +937,7 @@ mod tests {
         assert_tracing_output(
             || {
                 observability.emit_blocking_task_finished(
-                    "worker",
+                    &worker,
                     BlockingTaskId::from_u64(7),
                     Some("io"),
                     BlockingTaskStatus::Failed,
@@ -973,12 +1012,15 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             let observability = GraphObservability::new(Arc::from("orders"));
+            let frontend: Arc<str> = Arc::from("frontend");
+            let worker: Arc<str> = Arc::from("worker");
+            let requests: Arc<str> = Arc::from("requests");
 
             observability.emit_graph_started(2, 1, 64);
-            observability.emit_actor_started("frontend");
+            observability.emit_actor_started(&frontend);
             observability.emit_actor_message(
                 Some("frontend"),
-                "worker",
+                &worker,
                 MessageOperation::Send,
                 5,
                 Duration::from_millis(2),
@@ -986,45 +1028,45 @@ mod tests {
             );
             observability.emit_actor_message(
                 Some("frontend"),
-                "worker",
+                &worker,
                 MessageOperation::TrySend,
                 5,
                 Duration::from_millis(1),
                 Some(SendRejection::MailboxFull),
             );
-            observability.emit_message_received("worker", 5);
-            observability.emit_ingress_bound("requests", "frontend");
+            observability.emit_message_received(&worker, 5);
+            observability.emit_ingress_bound(&requests, &frontend);
             observability.emit_ingress_message(
-                "requests",
-                "frontend",
+                &requests,
+                &frontend,
                 MessageOperation::Send,
                 5,
                 Duration::from_millis(3),
                 None,
             );
             observability.emit_ingress_message(
-                "requests",
-                "frontend",
+                &requests,
+                &frontend,
                 MessageOperation::Send,
                 5,
                 Duration::from_millis(1),
                 Some(SendRejection::NotRunning),
             );
             observability.emit_blocking_task_started(
-                "worker",
+                &worker,
                 BlockingTaskId::from_u64(1),
                 Some("io"),
             );
             observability.emit_blocking_task_finished(
-                "worker",
+                &worker,
                 BlockingTaskId::from_u64(1),
                 Some("io"),
                 BlockingTaskStatus::Failed,
                 Duration::from_millis(4),
                 Some("boom"),
             );
-            observability.emit_actor_exited("frontend", ActorExitStatus::Shutdown, None);
-            observability.emit_ingress_cleared("requests", "frontend");
+            observability.emit_actor_exited(&frontend, ActorExitStatus::Shutdown, None);
+            observability.emit_ingress_cleared(&requests, &frontend);
             observability.emit_graph_stopped(Duration::from_millis(10), GraphRunStatus::Ok, None);
         });
 
