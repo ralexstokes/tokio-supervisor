@@ -3,7 +3,10 @@ use std::{
     collections::HashMap,
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use thiserror::Error;
@@ -213,6 +216,7 @@ pub struct BlockingHandle {
     id: BlockingTaskId,
     name: Option<Arc<str>>,
     cancel: CancellationToken,
+    state: Arc<BlockingTaskState>,
     completion_rx: oneshot::Receiver<Result<(), BlockingTaskError>>,
 }
 
@@ -233,7 +237,12 @@ impl BlockingHandle {
     }
 
     /// Waits for the blocking task to complete.
+    ///
+    /// Awaiting the handle claims responsibility for the task result, so
+    /// non-cancelled failures are returned here instead of also being
+    /// propagated as an actor failure.
     pub async fn wait(self) -> Result<(), BlockingTaskError> {
+        self.state.claim_for_wait();
         self.completion_rx
             .await
             .unwrap_or(Err(BlockingTaskError::Unavailable))
@@ -277,10 +286,7 @@ pub(crate) struct BlockingRuntime {
 }
 
 pub(crate) enum BlockingRuntimeEvent {
-    Completed {
-        task_id: BlockingTaskId,
-        failure: Option<BlockingTaskFailure>,
-    },
+    Completed { task_id: BlockingTaskId },
 }
 
 impl BlockingRuntime {
@@ -329,11 +335,8 @@ impl BlockingRuntime {
         }
 
         while let Ok(event) = self.event_rx.try_recv() {
-            if let BlockingRuntimeEvent::Completed {
-                failure: Some(failure),
-                ..
-            } = event
-            {
+            let BlockingRuntimeEvent::Completed { task_id } = event;
+            if let Some(failure) = self.reap_task(task_id).await {
                 first_failure.get_or_insert(failure);
             }
         }
@@ -349,12 +352,24 @@ impl BlockingRuntime {
 
     async fn await_entry(entry: BlockingTaskEntry) -> Option<BlockingTaskFailure> {
         match entry.join_handle.await {
-            Ok(()) => None,
-            Err(_) => Some(BlockingTaskFailure::new(
-                entry.id,
-                entry.name,
-                BlockingTaskError::Unavailable,
-            )),
+            Ok(failure) => {
+                if entry.state.was_claimed_for_wait() {
+                    None
+                } else {
+                    failure
+                }
+            }
+            Err(_) => {
+                if entry.state.was_claimed_for_wait() {
+                    None
+                } else {
+                    Some(BlockingTaskFailure::new(
+                        entry.id,
+                        entry.name,
+                        BlockingTaskError::Unavailable,
+                    ))
+                }
+            }
         }
     }
 }
@@ -378,6 +393,7 @@ impl BlockingRuntimeInner {
     {
         let task_name = options.into_name();
         let cancel = CancellationToken::new();
+        let state = Arc::new(BlockingTaskState::default());
         let (completion_tx, completion_rx) = oneshot::channel();
 
         let id = {
@@ -421,10 +437,8 @@ impl BlockingRuntimeInner {
                 .cloned()
                 .map(|error| BlockingTaskFailure::new(id, completion_name.clone(), error));
             let _ = completion_tx.send(result);
-            let _ = event_tx.send(BlockingRuntimeEvent::Completed {
-                task_id: id,
-                failure,
-            });
+            let _ = event_tx.send(BlockingRuntimeEvent::Completed { task_id: id });
+            failure
         });
 
         self.lock_state().tasks.insert(
@@ -433,6 +447,7 @@ impl BlockingRuntimeInner {
                 id,
                 name: task_name.clone(),
                 cancel: cancel.clone(),
+                state: Arc::clone(&state),
                 join_handle,
             },
         );
@@ -441,6 +456,7 @@ impl BlockingRuntimeInner {
             id,
             name: task_name,
             cancel,
+            state,
             completion_rx,
         })
     }
@@ -473,9 +489,25 @@ struct BlockingState {
     tasks: HashMap<BlockingTaskId, BlockingTaskEntry>,
 }
 
+#[derive(Default)]
+struct BlockingTaskState {
+    claimed_for_wait: AtomicBool,
+}
+
+impl BlockingTaskState {
+    fn claim_for_wait(&self) {
+        self.claimed_for_wait.store(true, Ordering::Release);
+    }
+
+    fn was_claimed_for_wait(&self) -> bool {
+        self.claimed_for_wait.load(Ordering::Acquire)
+    }
+}
+
 struct BlockingTaskEntry {
     id: BlockingTaskId,
     name: Option<Arc<str>>,
     cancel: CancellationToken,
-    join_handle: JoinHandle<()>,
+    state: Arc<BlockingTaskState>,
+    join_handle: JoinHandle<Option<BlockingTaskFailure>>,
 }

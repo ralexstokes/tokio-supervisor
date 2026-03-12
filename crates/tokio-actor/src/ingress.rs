@@ -46,11 +46,14 @@ impl MailboxRef {
     }
 
     pub(crate) fn blocking_send(&self, envelope: Envelope) -> Result<(), MailboxError> {
-        self.sender
-            .blocking_send(envelope)
-            .map_err(|_| MailboxError::MailboxClosed {
+        self.sender.try_send(envelope).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => MailboxError::MailboxFull {
                 actor_id: self.actor_id.clone(),
-            })
+            },
+            mpsc::error::TrySendError::Closed(_) => MailboxError::MailboxClosed {
+                actor_id: self.actor_id.clone(),
+            },
+        })
     }
 }
 

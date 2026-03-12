@@ -55,7 +55,11 @@ impl ActorRef {
             .map_err(map_mailbox_error)
     }
 
-    /// Sends an envelope from blocking code, waiting for mailbox capacity.
+    /// Sends an envelope from blocking code without requiring an async context.
+    ///
+    /// This returns [`SendError::MailboxFull`] instead of blocking the thread
+    /// when the mailbox is at capacity. Blocking callers that want to retry
+    /// should do so explicitly and check for cancellation between attempts.
     pub fn blocking_send(&self, envelope: impl Into<Envelope>) -> Result<(), SendError> {
         self.mailbox
             .blocking_send(envelope.into())
@@ -135,6 +139,9 @@ impl ActorContext {
     }
 
     /// Spawns tracked blocking work owned by this actor.
+    ///
+    /// If the returned handle is dropped without being awaited, non-cancelled
+    /// task failures are treated as actor failures.
     pub fn spawn_blocking<F>(
         &self,
         options: BlockingOptions,
@@ -147,6 +154,9 @@ impl ActorContext {
     }
 
     /// Runs tracked blocking work and waits for it to finish.
+    ///
+    /// Failures returned from this method are considered handled by the
+    /// caller and do not also fail the actor implicitly.
     pub async fn run_blocking<F>(
         &self,
         options: BlockingOptions,

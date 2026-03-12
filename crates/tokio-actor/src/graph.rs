@@ -156,10 +156,6 @@ impl GraphRuntime {
         while !self.join_set.is_empty() {
             tokio::select! {
                 biased;
-                _ = shutdown.as_mut(), if !shutdown_requested => {
-                    shutdown_requested = true;
-                    self.request_shutdown();
-                }
                 joined = self.join_set.join_next_with_id() => {
                     let Some(joined) = joined else {
                         break;
@@ -181,6 +177,10 @@ impl GraphRuntime {
                             failure.get_or_insert(error);
                         }
                     }
+                }
+                _ = shutdown.as_mut(), if !shutdown_requested => {
+                    shutdown_requested = true;
+                    self.request_shutdown();
                 }
             }
         }
@@ -276,20 +276,15 @@ impl GraphRuntime {
                 let actor_future = factory.make(ctx);
                 tokio::pin!(actor_future);
 
-                let mut first_blocking_failure = None;
                 let mut blocking_events_open = true;
                 let result = loop {
                     tokio::select! {
                         result = &mut actor_future => break result,
                         maybe_event = blocking.next_event(), if blocking_events_open => {
-                            if let Some(BlockingRuntimeEvent::Completed { task_id, failure }) = maybe_event {
-                                if let Some(failure) = failure {
-                                    actor_shutdown.cancel();
-                                    first_blocking_failure.get_or_insert(failure);
-                                }
-
+                            if let Some(BlockingRuntimeEvent::Completed { task_id }) = maybe_event {
                                 if let Some(failure) = blocking.reap_task(task_id).await {
-                                    first_blocking_failure.get_or_insert(failure);
+                                    actor_shutdown.cancel();
+                                    break Err(Box::new(failure));
                                 }
                             } else {
                                 blocking_events_open = false;
@@ -297,7 +292,7 @@ impl GraphRuntime {
                         }
                     }
                 };
-                let result = blocking.finish(result, first_blocking_failure).await;
+                let result = blocking.finish(result, None).await;
                 ActorTaskExit { actor_id, result }
             });
             self.task_ids.insert(abort_handle.id(), actor.id.clone());
