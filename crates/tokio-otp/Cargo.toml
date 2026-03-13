@@ -12,10 +12,10 @@ categories = ["asynchronous", "concurrency"]
 metrics = ["tokio-actor/metrics", "tokio-supervisor/metrics"]
 
 [dependencies]
-thiserror = "2.0.18"
-tokio-actor = { path = "../tokio-actor" }
-tokio-supervisor = { path = "../tokio-supervisor" }
+thiserror.workspace = true
+tokio-actor.workspace = true
+tokio-supervisor.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1.50.0", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7.18", features = ["rt"] }
+tokio.workspace = true
+tokio-util.workspace = true
