@@ -22,5 +22,4 @@ tracing = "0.1.44"
 [dev-dependencies]
 metrics-exporter-prometheus = "0.17"
 metrics-util = { version = "0.20", features = ["debugging"] }
-tokio-supervisor = { path = "../tokio-supervisor" }
 tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }

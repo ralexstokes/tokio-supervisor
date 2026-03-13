@@ -1,14 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicU8},
     time::Duration,
 };
 
 use crate::{
     actor::ActorSpec,
+    binding::MailboxBinding,
     error::BuildError,
     graph::{Graph, GraphInner, IngressDefinition},
-    ingress::IngressBinding,
     observability::{GraphObservability, anonymous_graph_name},
 };
 
@@ -164,6 +164,8 @@ impl GraphBuilder {
         let mut actor_ids = HashSet::new();
         let mut actors = Vec::with_capacity(self.actors.len());
         let mut links: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::new();
+        let mut bindings: HashMap<Arc<str>, Arc<MailboxBinding>> =
+            HashMap::with_capacity(self.actors.len());
 
         for actor in self.actors {
             if actor.id().is_empty() {
@@ -173,6 +175,10 @@ impl GraphBuilder {
                 return Err(BuildError::DuplicateActorId(actor.id().to_owned()));
             }
             links.insert(Arc::clone(&actor.inner.id), Vec::new());
+            bindings.insert(
+                Arc::clone(&actor.inner.id),
+                Arc::new(MailboxBinding::default()),
+            );
             actors.push(Arc::clone(&actor.inner));
         }
 
@@ -191,6 +197,7 @@ impl GraphBuilder {
 
         let mut ingress_names = HashSet::new();
         let mut ingresses: HashMap<Arc<str>, IngressDefinition> = HashMap::new();
+        let mut ingress_names_by_actor: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::new();
         for (name, target) in self.ingresses {
             if name.is_empty() {
                 return Err(BuildError::InvalidConfig("ingress name must not be empty"));
@@ -205,24 +212,26 @@ impl GraphBuilder {
                 });
             }
 
-            ingresses.insert(
-                name.into(),
-                IngressDefinition {
-                    target_actor: target.into(),
-                    binding: Arc::new(IngressBinding::default()),
-                },
-            );
+            let name: Arc<str> = name.into();
+            let target_actor: Arc<str> = target.into();
+            ingress_names_by_actor
+                .entry(Arc::clone(&target_actor))
+                .or_default()
+                .push(Arc::clone(&name));
+            ingresses.insert(name, IngressDefinition { target_actor });
         }
 
         Ok(Graph::new(GraphInner {
             actors,
             links,
+            bindings,
             mailbox_capacity: self.mailbox_capacity,
             max_envelope_bytes: self.max_envelope_bytes,
             max_blocking_tasks_per_actor: self.max_blocking_tasks_per_actor,
             blocking_shutdown_timeout: self.blocking_shutdown_timeout,
             ingresses,
-            running: AtomicBool::new(false),
+            ingress_names_by_actor,
+            state: AtomicU8::new(0),
             observability: GraphObservability::new(graph_name),
         }))
     }

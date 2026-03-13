@@ -1,43 +1,59 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    binding::{MailboxError, MailboxRef, MailboxSendFailure},
     blocking::{
         BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions, BlockingSpawner,
         SpawnBlockingError,
     },
     envelope::Envelope,
     error::SendError,
-    ingress::{MailboxError, MailboxRef},
     observability::{GraphObservability, MessageOperation, SendRejection},
 };
 
 /// Cloneable sender for an actor mailbox.
 #[derive(Clone, Debug)]
 pub struct ActorRef {
-    mailbox: MailboxRef,
+    actor_id: Arc<str>,
+    binding: watch::Receiver<Option<MailboxRef>>,
     observability: GraphObservability,
     source_actor_id: Option<Arc<str>>,
 }
 
 impl ActorRef {
-    pub(crate) fn from_mailbox(
-        mailbox: MailboxRef,
+    pub(crate) fn from_binding(
+        actor_id: Arc<str>,
+        binding: watch::Receiver<Option<MailboxRef>>,
         observability: GraphObservability,
         source_actor_id: Option<Arc<str>>,
     ) -> Self {
         Self {
-            mailbox,
+            actor_id,
+            binding,
             observability,
             source_actor_id,
         }
     }
 
+    fn current_mailbox(&self) -> Result<MailboxRef, SendError> {
+        self.binding
+            .borrow()
+            .clone()
+            .ok_or_else(|| SendError::ActorNotRunning {
+                actor_id: self.actor_id.to_string(),
+            })
+    }
+
+    async fn wait_for_next_binding(&mut self) -> bool {
+        self.binding.wait_for(|slot| slot.is_some()).await.is_ok()
+    }
+
     /// Returns the target actor id.
     pub fn id(&self) -> &str {
-        self.mailbox.actor_id()
+        &self.actor_id
     }
 
     /// Sends an envelope to the target actor, waiting for mailbox capacity.
@@ -45,11 +61,13 @@ impl ActorRef {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
         let started_at = self.observability.start_message_timing();
-        let result = self
-            .mailbox
-            .send(envelope)
-            .await
-            .map_err(MailboxError::into_send_error);
+        let result = match self.current_mailbox() {
+            Ok(mailbox) => mailbox
+                .send(envelope)
+                .await
+                .map_err(MailboxError::into_send_error),
+            Err(error) => Err(error),
+        };
         self.observe_send(
             MessageOperation::Send,
             envelope_len,
@@ -59,15 +77,95 @@ impl ActorRef {
         result
     }
 
+    /// Retries a send across transient restart windows until the actor is
+    /// rebound or the binding source is dropped.
+    pub async fn send_when_ready(
+        &mut self,
+        envelope: impl Into<Envelope>,
+    ) -> Result<(), SendError> {
+        let mut envelope = envelope.into();
+
+        loop {
+            let envelope_len = envelope.as_slice().len();
+            let started_at = self.observability.start_message_timing();
+
+            match self.current_mailbox() {
+                Ok(mailbox) => match mailbox.send_retaining(envelope).await {
+                    Ok(()) => {
+                        let result = Ok(());
+                        self.observe_send(
+                            MessageOperation::Send,
+                            envelope_len,
+                            GraphObservability::finish_message_timing(started_at),
+                            &result,
+                        );
+                        return result;
+                    }
+                    Err(MailboxSendFailure::EnvelopeTooLarge {
+                        envelope_len,
+                        max_envelope_bytes,
+                        ..
+                    }) => {
+                        let error = SendError::EnvelopeTooLarge {
+                            actor_id: self.actor_id.to_string(),
+                            envelope_len,
+                            max_envelope_bytes,
+                        };
+                        let result = Err(error.clone());
+                        self.observe_send(
+                            MessageOperation::Send,
+                            envelope_len,
+                            GraphObservability::finish_message_timing(started_at),
+                            &result,
+                        );
+                        return Err(error);
+                    }
+                    Err(MailboxSendFailure::MailboxClosed {
+                        envelope: returned, ..
+                    }) => {
+                        let error = SendError::MailboxClosed {
+                            actor_id: self.actor_id.to_string(),
+                        };
+                        let result = Err(error.clone());
+                        self.observe_send(
+                            MessageOperation::Send,
+                            envelope_len,
+                            GraphObservability::finish_message_timing(started_at),
+                            &result,
+                        );
+                        envelope = returned;
+                        if !self.wait_for_next_binding().await {
+                            return Err(error);
+                        }
+                    }
+                },
+                Err(error) => {
+                    let result = Err(error.clone());
+                    self.observe_send(
+                        MessageOperation::Send,
+                        envelope_len,
+                        GraphObservability::finish_message_timing(started_at),
+                        &result,
+                    );
+                    if !self.wait_for_next_binding().await {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
     /// Attempts to send an envelope without waiting for mailbox capacity.
     pub fn try_send(&self, envelope: impl Into<Envelope>) -> Result<(), SendError> {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
         let started_at = self.observability.start_message_timing();
-        let result = self
-            .mailbox
-            .try_send(envelope)
-            .map_err(MailboxError::into_send_error);
+        let result = match self.current_mailbox() {
+            Ok(mailbox) => mailbox
+                .try_send(envelope)
+                .map_err(MailboxError::into_send_error),
+            Err(error) => Err(error),
+        };
         self.observe_send(
             MessageOperation::TrySend,
             envelope_len,
@@ -86,10 +184,12 @@ impl ActorRef {
         let envelope = envelope.into();
         let envelope_len = envelope.as_slice().len();
         let started_at = self.observability.start_message_timing();
-        let result = self
-            .mailbox
-            .blocking_send(envelope)
-            .map_err(MailboxError::into_send_error);
+        let result = match self.current_mailbox() {
+            Ok(mailbox) => mailbox
+                .blocking_send(envelope)
+                .map_err(MailboxError::into_send_error),
+            Err(error) => Err(error),
+        };
         self.observe_send(
             MessageOperation::BlockingSend,
             envelope_len,
@@ -97,6 +197,14 @@ impl ActorRef {
             &result,
         );
         result
+    }
+
+    /// Waits until the actor is bound to a running mailbox.
+    ///
+    /// Returns immediately if the actor is already running. Returns if the
+    /// binding source is dropped.
+    pub async fn wait_for_binding(&mut self) {
+        let _ = self.wait_for_next_binding().await;
     }
 
     fn observe_send(
@@ -108,7 +216,7 @@ impl ActorRef {
     ) {
         self.observability.emit_actor_message(
             self.source_actor_id.as_deref(),
-            self.mailbox.actor_id_ref(),
+            &self.actor_id,
             operation,
             envelope_len,
             duration,
@@ -182,6 +290,31 @@ impl ActorContext {
 
         match self.peers.get(actor_id) {
             Some(peer) => peer.send(envelope).await,
+            None => Err(self.unknown_peer(actor_id, MessageOperation::Send, envelope_len)),
+        }
+    }
+
+    /// Sends an envelope to a linked peer, retrying across restart windows.
+    ///
+    /// If this actor begins shutting down before the peer becomes ready, the
+    /// send is abandoned and this returns `Ok(())` so the actor can exit
+    /// promptly.
+    pub async fn send_when_ready(
+        &self,
+        actor_id: &str,
+        envelope: impl Into<Envelope>,
+    ) -> Result<(), SendError> {
+        let envelope = envelope.into();
+        let envelope_len = envelope.as_slice().len();
+
+        match self.peers.get(actor_id) {
+            Some(peer) => {
+                let mut peer = peer.clone();
+                tokio::select! {
+                    _ = self.shutdown.cancelled() => Ok(()),
+                    result = peer.send_when_ready(envelope) => result,
+                }
+            }
             None => Err(self.unknown_peer(actor_id, MessageOperation::Send, envelope_len)),
         }
     }
@@ -261,6 +394,7 @@ impl ActorContext {
 fn send_rejection(error: &SendError) -> SendRejection {
     match error {
         SendError::UnknownPeer { .. } => SendRejection::UnknownPeer,
+        SendError::ActorNotRunning { .. } => SendRejection::NotRunning,
         SendError::EnvelopeTooLarge { .. } => SendRejection::EnvelopeTooLarge,
         SendError::MailboxFull { .. } => SendRejection::MailboxFull,
         SendError::MailboxClosed { .. } => SendRejection::MailboxClosed,

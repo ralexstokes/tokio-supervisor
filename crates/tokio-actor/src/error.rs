@@ -61,6 +61,9 @@ pub enum SendError {
     /// The sender attempted to address a peer that is not linked.
     #[error("actor `{actor_id}` is not linked to peer `{peer_id}`")]
     UnknownPeer { actor_id: String, peer_id: String },
+    /// The target actor is currently unbound because it is not running.
+    #[error("actor `{actor_id}` is not currently running")]
+    ActorNotRunning { actor_id: String },
     /// The envelope exceeds the configured mailbox payload limit.
     #[error(
         "envelope for actor `{actor_id}` exceeds max size of {max_envelope_bytes} bytes ({envelope_len} bytes)"

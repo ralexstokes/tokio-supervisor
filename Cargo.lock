@@ -942,7 +942,6 @@ dependencies = [
  "metrics-util",
  "thiserror",
  "tokio",
- "tokio-supervisor",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -957,6 +956,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-otp"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tokio",
+ "tokio-actor",
+ "tokio-supervisor",
+ "tokio-util",
 ]
 
 [[package]]

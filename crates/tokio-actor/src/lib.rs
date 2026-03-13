@@ -16,20 +16,24 @@
 //! |------|------|
 //! | [`GraphBuilder`] | Constructs and validates the actor graph. |
 //! | [`Graph`] | Immutable, cloneable graph spec that can be rerun. |
+//! | [`ActorSet`] | Decomposed graph where actors can be run independently. |
+//! | [`RunnableActor`] | One actor plus stable peer wiring for per-actor supervision. |
 //! | [`ActorSpec`] | Native Rust actor definition. |
 //! | [`ActorContext`] | Mailbox, peers, and shutdown token visible to one actor. |
-//! | [`ActorRef`] | Cloneable mailbox sender for a linked peer. |
+//! | [`ActorRef`] | Cloneable stable mailbox sender for a linked peer. |
 //! | [`IngressHandle`] | Stable external sender that survives graph reruns. |
 //! | [`Envelope`] | Opaque byte payload passed through the graph. |
 //!
-//! # Stable ingress handles
+//! # Stable mailbox handles
 //!
-//! Ingress handles are bound to a named entrypoint in the graph instead of a
-//! single actor runtime. When the same [`Graph`] is rerun, the handle is
-//! rebound to the current mailbox of its target actor.
+//! `ActorRef` and `IngressHandle` are bound to long-lived mailbox bindings
+//! instead of a single actor runtime. When a graph is rerun or a decomposed
+//! actor is restarted from the same graph wiring, those handles transparently
+//! follow the current mailbox for the target actor.
 //!
 //! This is especially useful when the graph is hosted inside a supervised
-//! child task and can be restarted by `tokio-supervisor`.
+//! child task and can be restarted by `tokio-supervisor`, or when a graph is
+//! decomposed with [`Graph::into_actor_set`] for per-actor supervision.
 //!
 //! # Observability
 //!
@@ -134,6 +138,8 @@
 //! | `metrics` | no | Enables `metrics` crate integration for counters, gauges, and histograms. |
 
 mod actor;
+mod actor_set;
+mod binding;
 mod blocking;
 mod builder;
 mod context;
@@ -145,14 +151,16 @@ mod observability;
 
 pub mod prelude {
     pub use crate::{
-        Actor, ActorContext, ActorRef, ActorResult, ActorSpec, BlockingContext, BlockingHandle,
-        BlockingOperationError, BlockingOptions, BlockingTaskError, BlockingTaskFailure,
-        BlockingTaskId, BuildError, Envelope, Graph, GraphBuilder, GraphError, IngressError,
-        IngressHandle, SendError, SpawnBlockingError,
+        Actor, ActorContext, ActorRef, ActorResult, ActorRunError, ActorSet, ActorSpec,
+        BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions,
+        BlockingTaskError, BlockingTaskFailure, BlockingTaskId, BuildError, Envelope, Graph,
+        GraphBuilder, GraphError, IngressError, IngressHandle, RunnableActor, SendError,
+        SpawnBlockingError,
     };
 }
 
 pub use actor::{Actor, ActorResult, ActorSpec, BoxError};
+pub use actor_set::{ActorRunError, ActorSet, RunnableActor};
 pub use blocking::{
     BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions, BlockingTaskError,
     BlockingTaskFailure, BlockingTaskId, SpawnBlockingError,

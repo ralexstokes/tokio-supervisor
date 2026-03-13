@@ -3,7 +3,7 @@ use std::{
     future::Future,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -17,52 +17,116 @@ use tracing::Instrument;
 
 use crate::{
     actor::{ActorResult, ActorSpecInner},
+    actor_set::ActorSet,
+    binding::{MailboxBinding, MailboxBindingGuard, MailboxRef},
     blocking::{BlockingRuntime, BlockingRuntimeEvent},
     context::{ActorContext, ActorRef},
     envelope::Envelope,
     error::GraphError,
-    ingress::{IngressBinding, IngressHandle, MailboxRef},
+    ingress::IngressHandle,
     observability::{ActorExitStatus, GraphObservability, GraphRunStatus, GraphShutdownCause},
 };
 
 type MailboxSenders = HashMap<Arc<str>, MailboxRef>;
 type MailboxReceivers = HashMap<Arc<str>, mpsc::Receiver<Envelope>>;
 
+const GRAPH_STATE_IDLE: u8 = 0;
+const GRAPH_STATE_RUNNING: u8 = 1;
+const GRAPH_STATE_DECOMPOSED: u8 = 2;
+
 pub(crate) struct IngressDefinition {
     pub(crate) target_actor: Arc<str>,
-    pub(crate) binding: Arc<IngressBinding>,
 }
 
 pub(crate) struct GraphInner {
     pub(crate) actors: Vec<Arc<ActorSpecInner>>,
     pub(crate) links: HashMap<Arc<str>, Vec<Arc<str>>>,
+    pub(crate) bindings: HashMap<Arc<str>, Arc<MailboxBinding>>,
     pub(crate) mailbox_capacity: usize,
     pub(crate) max_envelope_bytes: Option<usize>,
     pub(crate) max_blocking_tasks_per_actor: Option<usize>,
     pub(crate) blocking_shutdown_timeout: Duration,
     pub(crate) ingresses: HashMap<Arc<str>, IngressDefinition>,
-    pub(crate) running: AtomicBool,
+    pub(crate) ingress_names_by_actor: HashMap<Arc<str>, Vec<Arc<str>>>,
+    pub(crate) state: AtomicU8,
     pub(crate) observability: GraphObservability,
 }
 
 impl GraphInner {
-    fn clear_ingresses(&self) {
-        for (name, ingress) in &self.ingresses {
-            if ingress.binding.clear() {
-                self.observability
-                    .emit_ingress_cleared(name, &ingress.target_actor);
-            }
+    pub(crate) fn actor_binding(
+        &self,
+        actor_id: &Arc<str>,
+    ) -> Result<Arc<MailboxBinding>, GraphError> {
+        self.bindings
+            .get(actor_id)
+            .cloned()
+            .ok_or_else(|| GraphError::InvalidState {
+                detail: format!("actor `{actor_id}` is missing its mailbox binding"),
+            })
+    }
+
+    pub(crate) fn ingress_names_for_actor(&self, actor_id: &Arc<str>) -> Vec<Arc<str>> {
+        self.ingress_names_by_actor
+            .get(actor_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn ingress_handle(&self, name: &str) -> Option<IngressHandle> {
+        let (ingress_name, definition) = self.ingresses.get_key_value(name)?;
+        let binding = self.bindings.get(&definition.target_actor)?;
+        Some(IngressHandle::new(
+            Arc::clone(ingress_name),
+            Arc::clone(&definition.target_actor),
+            binding.subscribe(),
+            self.observability.clone(),
+        ))
+    }
+
+    pub(crate) fn ingress_handles(&self) -> HashMap<String, IngressHandle> {
+        self.ingresses
+            .iter()
+            .filter_map(|(name, definition)| {
+                self.bindings.get(&definition.target_actor).map(|binding| {
+                    (
+                        name.to_string(),
+                        IngressHandle::new(
+                            Arc::clone(name),
+                            Arc::clone(&definition.target_actor),
+                            binding.subscribe(),
+                            self.observability.clone(),
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn mark_decomposed(&self) -> Result<(), GraphError> {
+        match self.state.compare_exchange(
+            GRAPH_STATE_IDLE,
+            GRAPH_STATE_DECOMPOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(GRAPH_STATE_RUNNING) => Err(GraphError::AlreadyRunning),
+            Err(GRAPH_STATE_DECOMPOSED) => Err(GraphError::InvalidState {
+                detail: "graph has already been decomposed into an actor set".to_owned(),
+            }),
+            Err(_) => Err(GraphError::InvalidState {
+                detail: "graph state transition failed".to_owned(),
+            }),
         }
     }
 }
 
 /// Immutable actor graph specification.
 ///
-/// Clones of the same `Graph` share stable ingress bindings so handles created
-/// via [`ingress`](Self::ingress) keep working across reruns of the same
-/// graph. Because those bindings are shared, only one instance of a given
-/// graph spec may run at a time; concurrent reruns return
-/// [`GraphError::AlreadyRunning`].
+/// Clones of the same `Graph` share stable mailbox bindings so actor and
+/// ingress handles keep working across reruns of the same graph. Because those
+/// bindings are shared, only one instance of a given graph spec may run at a
+/// time; concurrent reruns return [`GraphError::AlreadyRunning`].
 #[derive(Clone)]
 pub struct Graph {
     inner: Arc<GraphInner>,
@@ -82,21 +146,25 @@ impl Graph {
 
     /// Returns a stable handle to a named ingress, if it exists.
     pub fn ingress(&self, name: &str) -> Option<IngressHandle> {
-        self.inner.ingresses.get(name).map(|definition| {
-            IngressHandle::new(
-                Arc::from(name),
-                Arc::clone(&definition.target_actor),
-                definition.binding.subscribe(),
-                self.inner.observability.clone(),
-            )
-        })
+        self.inner.ingress_handle(name)
+    }
+
+    /// Returns stable handles for every named ingress.
+    pub fn ingresses(&self) -> HashMap<String, IngressHandle> {
+        self.inner.ingress_handles()
+    }
+
+    /// Decomposes this graph into independently runnable actors.
+    pub fn into_actor_set(self) -> Result<ActorSet, GraphError> {
+        self.inner.mark_decomposed()?;
+        ActorSet::from_graph(Arc::clone(&self.inner))
     }
 
     /// Runs the graph until the provided shutdown future resolves.
     ///
     /// Actor failures and panics fail the whole graph. A clean actor exit
     /// before shutdown is also treated as a graph failure because the crate
-    /// does not provide internal supervision.
+    /// does not provide internal supervision in graph-run mode.
     pub async fn run_until<F>(&self, shutdown: F) -> Result<(), GraphError>
     where
         F: Future<Output = ()>,
@@ -145,23 +213,29 @@ struct ActiveRun {
 
 impl ActiveRun {
     fn start(inner: &Arc<GraphInner>) -> Result<Self, GraphError> {
-        if inner
-            .running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(GraphError::AlreadyRunning);
+        match inner.state.compare_exchange(
+            GRAPH_STATE_IDLE,
+            GRAPH_STATE_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(Self {
+                inner: Arc::clone(inner),
+            }),
+            Err(GRAPH_STATE_RUNNING) => Err(GraphError::AlreadyRunning),
+            Err(GRAPH_STATE_DECOMPOSED) => Err(GraphError::InvalidState {
+                detail: "graph has already been decomposed into an actor set".to_owned(),
+            }),
+            Err(_) => Err(GraphError::InvalidState {
+                detail: "graph state transition failed".to_owned(),
+            }),
         }
-        Ok(Self {
-            inner: Arc::clone(inner),
-        })
     }
 }
 
 impl Drop for ActiveRun {
     fn drop(&mut self) {
-        self.inner.clear_ingresses();
-        self.inner.running.store(false, Ordering::Release);
+        self.inner.state.store(GRAPH_STATE_IDLE, Ordering::Release);
     }
 }
 
@@ -187,8 +261,8 @@ impl GraphRuntime {
         F: Future<Output = ()>,
     {
         let (mailboxes, mut receivers) = self.create_mailboxes();
-        self.bind_ingresses_with(&mailboxes)?;
-        self.spawn_actors(&mailboxes, &mut receivers)?;
+        let mut bindings = self.bind_mailboxes(&mailboxes)?;
+        self.spawn_actors(&mut receivers, &mut bindings)?;
 
         let mut shutdown_requested = false;
         let mut failure = None;
@@ -246,7 +320,6 @@ impl GraphRuntime {
 
         self.inner.observability.emit_shutdown_requested(cause);
         self.shutdown.cancel();
-        self.inner.clear_ingresses();
     }
 
     fn create_mailboxes(&self) -> (MailboxSenders, MailboxReceivers) {
@@ -266,31 +339,37 @@ impl GraphRuntime {
         (mailboxes, receivers)
     }
 
-    fn bind_ingresses_with(&self, mailboxes: &MailboxSenders) -> Result<(), GraphError> {
-        for (name, ingress) in &self.inner.ingresses {
-            let mailbox = mailboxes
-                .get(&ingress.target_actor)
-                .cloned()
-                .ok_or_else(|| GraphError::InvalidState {
-                    detail: format!(
-                        "ingress `{name}` references missing actor mailbox `{}`",
-                        ingress.target_actor
-                    ),
-                })?;
-            if ingress.binding.bind(mailbox) {
-                self.inner
-                    .observability
-                    .emit_ingress_bound(name, &ingress.target_actor);
-            }
+    fn bind_mailboxes(
+        &self,
+        mailboxes: &MailboxSenders,
+    ) -> Result<HashMap<Arc<str>, MailboxBindingGuard>, GraphError> {
+        let mut bindings = HashMap::with_capacity(self.inner.actors.len());
+
+        for actor in &self.inner.actors {
+            let mailbox =
+                mailboxes
+                    .get(&actor.id)
+                    .cloned()
+                    .ok_or_else(|| GraphError::InvalidState {
+                        detail: format!("actor `{}` is missing its mailbox sender", actor.id),
+                    })?;
+            let binding = self.inner.actor_binding(&actor.id)?;
+            bindings.insert(
+                Arc::clone(&actor.id),
+                MailboxBindingGuard::bind(
+                    Arc::clone(&actor.id),
+                    binding,
+                    mailbox,
+                    self.inner.ingress_names_for_actor(&actor.id),
+                    self.inner.observability.clone(),
+                ),
+            );
         }
-        Ok(())
+
+        Ok(bindings)
     }
 
-    fn peer_refs(
-        &self,
-        actor_id: &Arc<str>,
-        mailboxes: &MailboxSenders,
-    ) -> Result<HashMap<Arc<str>, ActorRef>, GraphError> {
+    fn peer_refs(&self, actor_id: &Arc<str>) -> Result<HashMap<Arc<str>, ActorRef>, GraphError> {
         let linked_peers =
             self.inner
                 .links
@@ -301,19 +380,12 @@ impl GraphRuntime {
         let mut peers = HashMap::with_capacity(linked_peers.len());
 
         for peer_id in linked_peers {
-            let mailbox =
-                mailboxes
-                    .get(peer_id)
-                    .cloned()
-                    .ok_or_else(|| GraphError::InvalidState {
-                        detail: format!(
-                            "actor `{actor_id}` references missing peer mailbox `{peer_id}`"
-                        ),
-                    })?;
+            let binding = self.inner.actor_binding(peer_id)?;
             peers.insert(
                 Arc::clone(peer_id),
-                ActorRef::from_mailbox(
-                    mailbox,
+                ActorRef::from_binding(
+                    Arc::clone(peer_id),
+                    binding.subscribe(),
                     self.inner.observability.clone(),
                     Some(Arc::clone(actor_id)),
                 ),
@@ -335,35 +407,25 @@ impl GraphRuntime {
             })
     }
 
-    fn actor_ref(
-        &self,
-        actor_id: &Arc<str>,
-        mailboxes: &MailboxSenders,
-    ) -> Result<ActorRef, GraphError> {
-        mailboxes
-            .get(actor_id)
-            .cloned()
-            .map(|mailbox| {
-                ActorRef::from_mailbox(
-                    mailbox,
-                    self.inner.observability.clone(),
-                    Some(Arc::clone(actor_id)),
-                )
-            })
-            .ok_or_else(|| GraphError::InvalidState {
-                detail: format!("actor `{actor_id}` is missing its own mailbox sender"),
-            })
+    fn actor_ref(&self, actor_id: &Arc<str>) -> Result<ActorRef, GraphError> {
+        let binding = self.inner.actor_binding(actor_id)?;
+        Ok(ActorRef::from_binding(
+            Arc::clone(actor_id),
+            binding.subscribe(),
+            self.inner.observability.clone(),
+            Some(Arc::clone(actor_id)),
+        ))
     }
 
     fn spawn_actors(
         &mut self,
-        mailboxes: &MailboxSenders,
         receivers: &mut MailboxReceivers,
+        bindings: &mut HashMap<Arc<str>, MailboxBindingGuard>,
     ) -> Result<(), GraphError> {
         for actor in &self.inner.actors {
-            let peers = self.peer_refs(&actor.id, mailboxes)?;
+            let peers = self.peer_refs(&actor.id)?;
             let mailbox = self.mailbox_receiver(&actor.id, receivers)?;
-            let myself = self.actor_ref(&actor.id, mailboxes)?;
+            let myself = self.actor_ref(&actor.id)?;
             let actor_shutdown = self.shutdown.child_token();
             let mut blocking = BlockingRuntime::new(
                 actor.id.clone(),
@@ -388,31 +450,42 @@ impl GraphRuntime {
                 .inner
                 .observability
                 .actor_span(&actor_id, ctx.peers.len());
+            let bound_mailbox =
+                bindings
+                    .remove(&actor.id)
+                    .ok_or_else(|| GraphError::InvalidState {
+                        detail: format!("actor `{}` is missing its binding guard", actor.id),
+                    })?;
 
-            let abort_handle = self.join_set.spawn(async move {
-                let actor_future = factory.make(ctx);
-                tokio::pin!(actor_future);
+            let abort_handle = self
+                .join_set
+                .spawn(
+                    async move {
+                        let _bound_mailbox = bound_mailbox;
+                        let actor_future = factory.make(ctx);
+                        tokio::pin!(actor_future);
 
-                let mut blocking_events_open = true;
-                let result = loop {
-                    tokio::select! {
-                        result = &mut actor_future => break result,
-                        maybe_event = blocking.next_event(), if blocking_events_open => {
-                            if let Some(BlockingRuntimeEvent::Completed { task_id }) = maybe_event {
-                                if let Some(failure) = blocking.reap_task(task_id).await {
-                                    actor_shutdown.cancel();
-                                    break Err(Box::new(failure));
+                        let mut blocking_events_open = true;
+                        let result = loop {
+                            tokio::select! {
+                                result = &mut actor_future => break result,
+                                maybe_event = blocking.next_event(), if blocking_events_open => {
+                                    if let Some(BlockingRuntimeEvent::Completed { task_id }) = maybe_event {
+                                        if let Some(failure) = blocking.reap_task(task_id).await {
+                                            actor_shutdown.cancel();
+                                            break Err(Box::new(failure));
+                                        }
+                                    } else {
+                                        blocking_events_open = false;
+                                    }
                                 }
-                            } else {
-                                blocking_events_open = false;
                             }
-                        }
+                        };
+                        let result = blocking.finish(result).await;
+                        ActorTaskExit { actor_id, result }
                     }
-                };
-                let result = blocking.finish(result).await;
-                ActorTaskExit { actor_id, result }
-            }
-            .instrument(actor_span));
+                    .instrument(actor_span),
+                );
             self.task_ids.insert(abort_handle.id(), actor.id.clone());
             self.inner.observability.emit_actor_started(&actor.id);
         }

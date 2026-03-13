@@ -1,160 +1,19 @@
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use crate::{
+    binding::{MailboxError, MailboxRef, MailboxSendFailure},
     envelope::Envelope,
-    error::{IngressError, SendError},
+    error::IngressError,
     observability::{GraphObservability, MessageOperation, SendRejection},
 };
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum MailboxError {
-    EnvelopeTooLarge {
-        actor_id: Arc<str>,
-        envelope_len: usize,
-        max_envelope_bytes: usize,
-    },
-    MailboxFull {
-        actor_id: Arc<str>,
-    },
-    MailboxClosed {
-        actor_id: Arc<str>,
-    },
-}
-
-impl MailboxError {
-    fn closed(actor_id: &Arc<str>) -> Self {
-        Self::MailboxClosed {
-            actor_id: Arc::clone(actor_id),
-        }
-    }
-
-    fn from_try_send(actor_id: &Arc<str>, err: mpsc::error::TrySendError<Envelope>) -> Self {
-        match err {
-            mpsc::error::TrySendError::Full(_) => Self::MailboxFull {
-                actor_id: Arc::clone(actor_id),
-            },
-            mpsc::error::TrySendError::Closed(_) => Self::closed(actor_id),
-        }
-    }
-
-    pub(crate) fn into_send_error(self) -> SendError {
-        match self {
-            Self::EnvelopeTooLarge {
-                actor_id,
-                envelope_len,
-                max_envelope_bytes,
-            } => SendError::EnvelopeTooLarge {
-                actor_id: actor_id.to_string(),
-                envelope_len,
-                max_envelope_bytes,
-            },
-            Self::MailboxFull { actor_id } => SendError::MailboxFull {
-                actor_id: actor_id.to_string(),
-            },
-            Self::MailboxClosed { actor_id } => SendError::MailboxClosed {
-                actor_id: actor_id.to_string(),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct MailboxRef {
-    actor_id: Arc<str>,
-    sender: mpsc::Sender<Envelope>,
-    max_envelope_bytes: Option<usize>,
-}
-
-impl MailboxRef {
-    pub(crate) fn new(
-        actor_id: Arc<str>,
-        sender: mpsc::Sender<Envelope>,
-        max_envelope_bytes: Option<usize>,
-    ) -> Self {
-        Self {
-            actor_id,
-            sender,
-            max_envelope_bytes,
-        }
-    }
-
-    pub(crate) fn actor_id(&self) -> &str {
-        &self.actor_id
-    }
-
-    pub(crate) fn actor_id_ref(&self) -> &Arc<str> {
-        &self.actor_id
-    }
-
-    pub(crate) async fn send(&self, envelope: Envelope) -> Result<(), MailboxError> {
-        self.validate_envelope(&envelope)?;
-        self.sender
-            .send(envelope)
-            .await
-            .map_err(|_| MailboxError::closed(&self.actor_id))
-    }
-
-    pub(crate) fn try_send(&self, envelope: Envelope) -> Result<(), MailboxError> {
-        self.validate_envelope(&envelope)?;
-        self.sender
-            .try_send(envelope)
-            .map_err(|err| MailboxError::from_try_send(&self.actor_id, err))
-    }
-
-    pub(crate) fn blocking_send(&self, envelope: Envelope) -> Result<(), MailboxError> {
-        self.try_send(envelope)
-    }
-
-    fn validate_envelope(&self, envelope: &Envelope) -> Result<(), MailboxError> {
-        let Some(max_envelope_bytes) = self.max_envelope_bytes else {
-            return Ok(());
-        };
-
-        let envelope_len = envelope.as_slice().len();
-        if envelope_len <= max_envelope_bytes {
-            return Ok(());
-        }
-
-        Err(MailboxError::EnvelopeTooLarge {
-            actor_id: Arc::clone(&self.actor_id),
-            envelope_len,
-            max_envelope_bytes,
-        })
-    }
-}
-
-pub(crate) struct IngressBinding {
-    current: watch::Sender<Option<MailboxRef>>,
-}
-
-impl Default for IngressBinding {
-    fn default() -> Self {
-        let (current, _receiver) = watch::channel(None);
-        Self { current }
-    }
-}
-
-impl IngressBinding {
-    pub(crate) fn bind(&self, mailbox: MailboxRef) -> bool {
-        self.current.send_replace(Some(mailbox)).is_none()
-    }
-
-    pub(crate) fn clear(&self) -> bool {
-        self.current.send_replace(None).is_some()
-    }
-
-    pub(crate) fn subscribe(&self) -> watch::Receiver<Option<MailboxRef>> {
-        self.current.subscribe()
-    }
-}
-
 /// Stable external sender that targets a named ingress point.
 ///
-/// Handles are bound to the currently-running instance of the graph. If the
-/// graph is restarted from the same [`Graph`](crate::Graph), the handle is
-/// rebound to the new actor mailbox automatically.
+/// Handles are bound to the currently-running instance of the target actor. If
+/// the graph is rerun or the actor is restarted from the same long-lived graph
+/// wiring, the handle is rebound to the new mailbox automatically.
 #[derive(Clone)]
 pub struct IngressHandle {
     name: Arc<str>,
@@ -211,6 +70,27 @@ impl IngressHandle {
         }
     }
 
+    async fn wait_for_next_binding(&mut self) -> bool {
+        self.binding.wait_for(|slot| slot.is_some()).await.is_ok()
+    }
+
+    fn observe_send(
+        &self,
+        operation: MessageOperation,
+        envelope_len: usize,
+        duration: std::time::Duration,
+        result: &Result<(), IngressError>,
+    ) {
+        self.observability.emit_ingress_message(
+            &self.name,
+            &self.actor_id,
+            operation,
+            envelope_len,
+            duration,
+            result.as_ref().err().map(ingress_rejection),
+        );
+    }
+
     /// Returns the ingress name.
     pub fn name(&self) -> &str {
         &self.name
@@ -243,6 +123,86 @@ impl IngressHandle {
         result
     }
 
+    /// Retries a send across transient restart windows until the ingress is
+    /// rebound or the binding source is dropped.
+    pub async fn send_when_ready(
+        &mut self,
+        envelope: impl Into<Envelope>,
+    ) -> Result<(), IngressError> {
+        let mut envelope = envelope.into();
+
+        loop {
+            let envelope_len = envelope.as_slice().len();
+            let started_at = self.observability.start_message_timing();
+
+            match self.current_mailbox() {
+                Ok(mailbox) => match mailbox.send_retaining(envelope).await {
+                    Ok(()) => {
+                        let result = Ok(());
+                        self.observe_send(
+                            MessageOperation::Send,
+                            envelope_len,
+                            GraphObservability::finish_message_timing(started_at),
+                            &result,
+                        );
+                        return result;
+                    }
+                    Err(MailboxSendFailure::EnvelopeTooLarge {
+                        envelope_len,
+                        max_envelope_bytes,
+                        ..
+                    }) => {
+                        let error = IngressError::EnvelopeTooLarge {
+                            ingress: self.name.to_string(),
+                            actor_id: self.actor_id.to_string(),
+                            envelope_len,
+                            max_envelope_bytes,
+                        };
+                        let result = Err(error.clone());
+                        self.observe_send(
+                            MessageOperation::Send,
+                            envelope_len,
+                            GraphObservability::finish_message_timing(started_at),
+                            &result,
+                        );
+                        return Err(error);
+                    }
+                    Err(MailboxSendFailure::MailboxClosed {
+                        envelope: returned, ..
+                    }) => {
+                        let error = IngressError::MailboxClosed {
+                            ingress: self.name.to_string(),
+                            actor_id: self.actor_id.to_string(),
+                        };
+                        let result = Err(error.clone());
+                        self.observe_send(
+                            MessageOperation::Send,
+                            envelope_len,
+                            GraphObservability::finish_message_timing(started_at),
+                            &result,
+                        );
+                        envelope = returned;
+                        if !self.wait_for_next_binding().await {
+                            return Err(error);
+                        }
+                    }
+                },
+                Err(error) => {
+                    let result = Err(error.clone());
+                    self.observe_send(
+                        MessageOperation::Send,
+                        envelope_len,
+                        GraphObservability::finish_message_timing(started_at),
+                        &result,
+                    );
+                    if !self.wait_for_next_binding().await {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
     /// Attempts to send an envelope through the ingress without waiting.
     pub fn try_send(&self, envelope: impl Into<Envelope>) -> Result<(), IngressError> {
         let envelope = envelope.into();
@@ -264,29 +224,12 @@ impl IngressHandle {
         result
     }
 
-    /// Waits until the ingress is bound to a running graph instance.
+    /// Waits until the ingress is bound to a running actor instance.
     ///
-    /// Returns immediately if the graph is already running. Returns if the
-    /// graph (and its ingress bindings) is dropped.
+    /// Returns immediately if the target actor is already running. Returns if
+    /// the binding source is dropped.
     pub async fn wait_for_binding(&mut self) {
-        let _ = self.binding.wait_for(|slot| slot.is_some()).await;
-    }
-
-    fn observe_send(
-        &self,
-        operation: MessageOperation,
-        envelope_len: usize,
-        duration: std::time::Duration,
-        result: &Result<(), IngressError>,
-    ) {
-        self.observability.emit_ingress_message(
-            &self.name,
-            &self.actor_id,
-            operation,
-            envelope_len,
-            duration,
-            result.as_ref().err().map(ingress_rejection),
-        );
+        let _ = self.wait_for_next_binding().await;
     }
 }
 
