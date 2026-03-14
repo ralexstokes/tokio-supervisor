@@ -439,6 +439,7 @@ impl GraphRuntime {
                 id: actor.id.clone(),
                 mailbox,
                 peers,
+                registry: None,
                 myself,
                 shutdown: actor_shutdown.clone(),
                 blocking: blocking.spawner(),

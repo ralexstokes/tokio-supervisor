@@ -12,18 +12,18 @@ mod supervised_graph;
 
 pub mod prelude {
     pub use tokio_actor::{
-        Actor, ActorContext, ActorRef, ActorRunError, ActorSet, ActorSpec, Envelope, Graph,
-        GraphBuilder, IngressHandle, RunnableActor,
+        Actor, ActorContext, ActorRef, ActorRegistry, ActorRunError, ActorSet, ActorSpec, Envelope,
+        Graph, GraphBuilder, IngressHandle, RunnableActor, RunnableActorFactory,
     };
     pub use tokio_supervisor::{
         ChildContext, ChildSpec, Restart, RestartIntensity, ShutdownMode, ShutdownPolicy, Strategy,
         Supervisor, SupervisorBuilder, SupervisorEvent, SupervisorHandle, SupervisorSnapshot,
     };
 
-    pub use crate::{SupervisedActors, SupervisedGraph};
+    pub use crate::{DynamicActorError, DynamicActorOptions, SupervisedActors, SupervisedGraph};
 }
 
-pub use error::BuildError;
-pub use runtime::{Runtime, RuntimeHandle};
+pub use error::{BuildError, DynamicActorError};
+pub use runtime::{DynamicActorOptions, Runtime, RuntimeHandle};
 pub use supervised_actors::SupervisedActors;
 pub use supervised_graph::SupervisedGraph;

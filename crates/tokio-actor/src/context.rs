@@ -12,6 +12,7 @@ use crate::{
     envelope::Envelope,
     error::SendError,
     observability::{GraphObservability, MessageOperation, SendRejection},
+    registry::ActorRegistry,
 };
 
 /// Cloneable sender for an actor mailbox.
@@ -230,6 +231,7 @@ pub struct ActorContext {
     pub(crate) id: Arc<str>,
     pub(crate) mailbox: mpsc::Receiver<Envelope>,
     pub(crate) peers: HashMap<Arc<str>, ActorRef>,
+    pub(crate) registry: Option<ActorRegistry>,
     pub(crate) myself: ActorRef,
     pub(crate) shutdown: CancellationToken,
     pub(crate) blocking: BlockingSpawner,
@@ -274,6 +276,11 @@ impl ActorContext {
         self.peers.get(actor_id).cloned()
     }
 
+    /// Returns the optional runtime actor registry.
+    pub fn registry(&self) -> Option<&ActorRegistry> {
+        self.registry.as_ref()
+    }
+
     /// Returns a sender targeting this actor's own mailbox.
     pub fn myself(&self) -> ActorRef {
         self.myself.clone()
@@ -290,7 +297,7 @@ impl ActorContext {
 
         match self.peers.get(actor_id) {
             Some(peer) => peer.send(envelope).await,
-            None => Err(self.unknown_peer(actor_id, MessageOperation::Send, envelope_len)),
+            None => Err(self.unknown_target(actor_id, MessageOperation::Send, envelope_len)),
         }
     }
 
@@ -315,7 +322,7 @@ impl ActorContext {
                     result = peer.send_when_ready(envelope) => result,
                 }
             }
-            None => Err(self.unknown_peer(actor_id, MessageOperation::Send, envelope_len)),
+            None => Err(self.unknown_target(actor_id, MessageOperation::Send, envelope_len)),
         }
     }
 
@@ -326,7 +333,46 @@ impl ActorContext {
 
         match self.peers.get(actor_id) {
             Some(peer) => peer.try_send(envelope),
-            None => Err(self.unknown_peer(actor_id, MessageOperation::TrySend, envelope_len)),
+            None => Err(self.unknown_target(actor_id, MessageOperation::TrySend, envelope_len)),
+        }
+    }
+
+    /// Sends an envelope to a statically linked peer or registry-discovered
+    /// actor.
+    pub async fn send_dynamic(
+        &self,
+        actor_id: &str,
+        envelope: impl Into<Envelope>,
+    ) -> Result<(), SendError> {
+        let envelope = envelope.into();
+        let envelope_len = envelope.as_slice().len();
+
+        if let Some(peer) = self.resolve_dynamic_peer(actor_id) {
+            return peer.send(envelope).await;
+        }
+
+        Err(self.unknown_target(actor_id, MessageOperation::Send, envelope_len))
+    }
+
+    /// Sends an envelope to a statically linked peer or registry-discovered
+    /// actor, retrying across restart windows.
+    pub async fn send_dynamic_when_ready(
+        &self,
+        actor_id: &str,
+        envelope: impl Into<Envelope>,
+    ) -> Result<(), SendError> {
+        let envelope = envelope.into();
+        let envelope_len = envelope.as_slice().len();
+
+        match self.resolve_dynamic_peer(actor_id) {
+            Some(peer) => {
+                let mut peer = peer;
+                tokio::select! {
+                    _ = self.shutdown.cancelled() => Ok(()),
+                    result = peer.send_when_ready(envelope) => result,
+                }
+            }
+            None => Err(self.unknown_target(actor_id, MessageOperation::Send, envelope_len)),
         }
     }
 
@@ -367,7 +413,15 @@ impl ActorContext {
         handle.wait().await
     }
 
-    fn unknown_peer(
+    fn resolve_dynamic_peer(&self, actor_id: &str) -> Option<ActorRef> {
+        self.peers.get(actor_id).cloned().or_else(|| {
+            self.registry
+                .as_ref()
+                .and_then(|registry| registry.actor_ref_for_source(actor_id, Some(&self.id)))
+        })
+    }
+
+    fn unknown_target(
         &self,
         actor_id: &str,
         operation: MessageOperation,

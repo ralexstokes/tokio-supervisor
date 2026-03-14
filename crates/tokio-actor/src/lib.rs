@@ -148,19 +148,20 @@ mod error;
 mod graph;
 mod ingress;
 mod observability;
+mod registry;
 
 pub mod prelude {
     pub use crate::{
-        Actor, ActorContext, ActorRef, ActorResult, ActorRunError, ActorSet, ActorSpec,
-        BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions,
+        Actor, ActorContext, ActorRef, ActorRegistry, ActorResult, ActorRunError, ActorSet,
+        ActorSpec, BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions,
         BlockingTaskError, BlockingTaskFailure, BlockingTaskId, BuildError, Envelope, Graph,
-        GraphBuilder, GraphError, IngressError, IngressHandle, RunnableActor, SendError,
-        SpawnBlockingError,
+        GraphBuilder, GraphError, IngressError, IngressHandle, RegistryError, RunnableActor,
+        RunnableActorFactory, SendError, SpawnBlockingError,
     };
 }
 
 pub use actor::{Actor, ActorResult, ActorSpec, BoxError};
-pub use actor_set::{ActorRunError, ActorSet, RunnableActor};
+pub use actor_set::{ActorRunError, ActorSet, RunnableActor, RunnableActorFactory};
 pub use blocking::{
     BlockingContext, BlockingHandle, BlockingOperationError, BlockingOptions, BlockingTaskError,
     BlockingTaskFailure, BlockingTaskId, SpawnBlockingError,
@@ -171,3 +172,4 @@ pub use envelope::Envelope;
 pub use error::{BuildError, GraphError, IngressError, SendError};
 pub use graph::Graph;
 pub use ingress::IngressHandle;
+pub use registry::{ActorRegistry, RegistryError};

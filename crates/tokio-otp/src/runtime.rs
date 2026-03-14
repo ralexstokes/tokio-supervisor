@@ -1,17 +1,70 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::{broadcast, watch};
-use tokio_actor::IngressHandle;
-use tokio_supervisor::{
-    ChildSpec, ControlError, Supervisor, SupervisorError, SupervisorEvent, SupervisorExit,
-    SupervisorHandle, SupervisorSnapshot,
+use tokio_actor::{
+    ActorRef, ActorRegistry, ActorSpec, IngressHandle, RunnableActor, RunnableActorFactory,
 };
+use tokio_supervisor::{
+    ChildSpec, ControlError, Restart, RestartIntensity, ShutdownPolicy, Supervisor,
+    SupervisorError, SupervisorEvent, SupervisorExit, SupervisorHandle, SupervisorSnapshot,
+};
+
+use crate::error::DynamicActorError;
+
+#[derive(Clone, Debug)]
+struct DynamicRuntimeState {
+    registry: ActorRegistry,
+    actor_factory: RunnableActorFactory,
+}
+
+impl DynamicRuntimeState {
+    fn build_actor(
+        &self,
+        spec: ActorSpec,
+        options: &DynamicActorOptions,
+    ) -> Result<RunnableActor, DynamicActorError> {
+        let actor = if options.peer_ids.is_empty() {
+            self.actor_factory.actor(spec)
+        } else {
+            self.actor_factory
+                .actor_with_peer_ids(spec, &self.registry, &options.peer_ids)?
+        };
+        actor.set_registry(self.registry.clone());
+        Ok(actor)
+    }
+}
+
+/// Options applied when adding a runtime actor to a supervised runtime.
+#[derive(Clone, Debug)]
+pub struct DynamicActorOptions {
+    /// Restart policy for the supervised actor child.
+    pub restart: Restart,
+    /// Shutdown policy for the supervised actor child.
+    pub shutdown: ShutdownPolicy,
+    /// Optional restart intensity override for this actor child.
+    pub restart_intensity: Option<RestartIntensity>,
+    /// Initial peer ids that should be available through `ctx.peer()` /
+    /// `ctx.send()` inside the dynamic actor.
+    pub peer_ids: Vec<String>,
+}
+
+impl Default for DynamicActorOptions {
+    fn default() -> Self {
+        Self {
+            restart: Restart::Transient,
+            shutdown: ShutdownPolicy::default(),
+            restart_intensity: None,
+            peer_ids: Vec::new(),
+        }
+    }
+}
 
 /// Configured-but-not-yet-running runtime that owns a supervisor and its
 /// stable ingress handles.
 pub struct Runtime {
     supervisor: Supervisor,
     ingresses: HashMap<String, IngressHandle>,
+    dynamic: Option<Arc<DynamicRuntimeState>>,
 }
 
 impl Runtime {
@@ -20,6 +73,23 @@ impl Runtime {
         Self {
             supervisor,
             ingresses,
+            dynamic: None,
+        }
+    }
+
+    pub(crate) fn with_dynamic(
+        supervisor: Supervisor,
+        ingresses: HashMap<String, IngressHandle>,
+        registry: ActorRegistry,
+        actor_factory: RunnableActorFactory,
+    ) -> Self {
+        Self {
+            supervisor,
+            ingresses,
+            dynamic: Some(Arc::new(DynamicRuntimeState {
+                registry,
+                actor_factory,
+            })),
         }
     }
 
@@ -45,7 +115,7 @@ impl Runtime {
 
     /// Spawns the supervisor in the background and returns a combined handle.
     pub fn spawn(self) -> RuntimeHandle {
-        RuntimeHandle::new(self.supervisor.spawn(), self.ingresses)
+        RuntimeHandle::new(self.supervisor.spawn(), self.ingresses, self.dynamic)
     }
 }
 
@@ -62,13 +132,19 @@ impl std::fmt::Debug for Runtime {
 pub struct RuntimeHandle {
     supervisor: SupervisorHandle,
     ingresses: Arc<HashMap<String, IngressHandle>>,
+    dynamic: Option<Arc<DynamicRuntimeState>>,
 }
 
 impl RuntimeHandle {
-    fn new(supervisor: SupervisorHandle, ingresses: HashMap<String, IngressHandle>) -> Self {
+    fn new(
+        supervisor: SupervisorHandle,
+        ingresses: HashMap<String, IngressHandle>,
+        dynamic: Option<Arc<DynamicRuntimeState>>,
+    ) -> Self {
         Self {
             supervisor,
             ingresses: Arc::new(ingresses),
+            dynamic,
         }
     }
 
@@ -87,6 +163,13 @@ impl RuntimeHandle {
         self.supervisor.clone()
     }
 
+    /// Returns a stable actor reference for a registered actor id.
+    pub fn actor_ref(&self, actor_id: &str) -> Option<ActorRef> {
+        self.dynamic
+            .as_ref()
+            .and_then(|dynamic| dynamic.registry.actor_ref(actor_id))
+    }
+
     /// Requests a graceful shutdown of the supervisor.
     pub fn shutdown(&self) {
         self.supervisor.shutdown();
@@ -100,6 +183,35 @@ impl RuntimeHandle {
     /// Adds a new child to the supervisor at runtime.
     pub async fn add_child(&self, child: ChildSpec) -> Result<(), ControlError> {
         self.supervisor.add_child(child).await
+    }
+
+    /// Adds a runtime actor to a supervised actor runtime.
+    pub async fn add_actor(
+        &self,
+        spec: ActorSpec,
+        options: DynamicActorOptions,
+    ) -> Result<ActorRef, DynamicActorError> {
+        let dynamic = self
+            .dynamic
+            .as_ref()
+            .ok_or(DynamicActorError::Unsupported)?;
+        let actor = dynamic.build_actor(spec, &options)?;
+        let actor_ref = actor.actor_ref();
+
+        actor.register_with(&dynamic.registry)?;
+
+        let child = actor_child_spec(
+            actor,
+            options.restart,
+            options.shutdown,
+            options.restart_intensity,
+        );
+        if let Err(err) = self.supervisor.add_child(child).await {
+            let _ = dynamic.registry.deregister(actor_ref.id());
+            return Err(err.into());
+        }
+
+        Ok(actor_ref)
     }
 
     /// Like [`Self::add_child`], but returns immediately if the control
@@ -134,6 +246,17 @@ impl RuntimeHandle {
     /// Removes a child from the supervisor.
     pub async fn remove_child(&self, id: impl Into<String>) -> Result<(), ControlError> {
         self.supervisor.remove_child(id).await
+    }
+
+    /// Removes a runtime-registered actor from the supervised runtime.
+    pub async fn remove_actor(&self, actor_id: &str) -> Result<(), DynamicActorError> {
+        let dynamic = self
+            .dynamic
+            .as_ref()
+            .ok_or(DynamicActorError::Unsupported)?;
+        self.supervisor.remove_child(actor_id.to_owned()).await?;
+        dynamic.registry.deregister(actor_id)?;
+        Ok(())
     }
 
     /// Like [`Self::remove_child`], but returns immediately if the control
@@ -196,4 +319,30 @@ impl std::fmt::Debug for RuntimeHandle {
             .field("ingresses", &self.ingresses.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
+}
+
+pub(crate) fn actor_child_spec(
+    actor: RunnableActor,
+    restart: Restart,
+    shutdown: ShutdownPolicy,
+    restart_intensity: Option<RestartIntensity>,
+) -> ChildSpec {
+    let actor_id = actor.id().to_owned();
+    let mut child = ChildSpec::new(actor_id, move |ctx| {
+        let actor = actor.clone();
+        async move {
+            actor
+                .run_until(ctx.token.cancelled())
+                .await
+                .map_err(Into::into)
+        }
+    })
+    .restart(restart)
+    .shutdown(shutdown);
+
+    if let Some(intensity) = restart_intensity {
+        child = child.restart_intensity(intensity);
+    }
+
+    child
 }

@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
-use tokio_actor::{ActorSet, Graph, IngressHandle};
+use tokio_actor::{ActorRegistry, ActorSet, Graph, IngressHandle};
 use tokio_supervisor::{
     ChildSpec, Restart, RestartIntensity, ShutdownPolicy, Supervisor, SupervisorBuilder,
 };
 
-use crate::{error::BuildError, runtime::Runtime};
+use crate::{
+    error::BuildError,
+    runtime::{Runtime, actor_child_spec},
+};
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ActorOverrides {
@@ -81,14 +84,7 @@ impl SupervisedActors {
     /// Builds reusable child specs plus stable ingress handles.
     pub fn build(self) -> Result<(Vec<ChildSpec>, HashMap<String, IngressHandle>), BuildError> {
         self.validate_overrides()?;
-
-        let children = self
-            .actor_set
-            .actors()
-            .iter()
-            .cloned()
-            .map(|actor| self.actor_child(actor))
-            .collect();
+        let children = self.actor_children();
         let ingresses = self.actor_set.ingresses();
 
         Ok((children, ingresses))
@@ -111,8 +107,28 @@ impl SupervisedActors {
     /// Adds the actor children to a supervisor builder and packages the result
     /// into a [`Runtime`].
     pub fn build_runtime(self, builder: SupervisorBuilder) -> Result<Runtime, BuildError> {
-        let (supervisor, ingresses) = self.build_supervisor(builder)?;
-        Ok(Runtime::new(supervisor, ingresses))
+        self.validate_overrides()?;
+
+        let registry = ActorRegistry::new();
+        for actor in self.actor_set.actors() {
+            actor.set_registry(registry.clone());
+            actor.register_with(&registry)?;
+        }
+
+        let actor_factory = self.actor_set.dynamic_factory();
+        let children = self.actor_children();
+        let ingresses = self.actor_set.ingresses();
+        let builder = children
+            .into_iter()
+            .fold(builder, |builder, child| builder.child(child));
+        let supervisor = builder.build()?;
+
+        Ok(Runtime::with_dynamic(
+            supervisor,
+            ingresses,
+            registry,
+            actor_factory,
+        ))
     }
 
     fn validate_overrides(&self) -> Result<(), BuildError> {
@@ -127,25 +143,22 @@ impl SupervisedActors {
         Ok(())
     }
 
+    fn actor_children(&self) -> Vec<ChildSpec> {
+        self.actor_set
+            .actors()
+            .iter()
+            .cloned()
+            .map(|actor| self.actor_child(actor))
+            .collect()
+    }
+
     fn actor_child(&self, actor: tokio_actor::RunnableActor) -> ChildSpec {
         let overrides = self.overrides.get(actor.id()).copied().unwrap_or_default();
-        let actor_id = actor.id().to_owned();
-        let mut child = ChildSpec::new(actor_id, move |ctx| {
-            let actor = actor.clone();
-            async move {
-                actor
-                    .run_until(ctx.token.cancelled())
-                    .await
-                    .map_err(Into::into)
-            }
-        })
-        .restart(overrides.restart.unwrap_or(self.default_restart))
-        .shutdown(overrides.shutdown.unwrap_or(self.default_shutdown));
-
-        if let Some(intensity) = overrides.restart_intensity {
-            child = child.restart_intensity(intensity);
-        }
-
-        child
+        actor_child_spec(
+            actor,
+            overrides.restart.unwrap_or(self.default_restart),
+            overrides.shutdown.unwrap_or(self.default_shutdown),
+            overrides.restart_intensity,
+        )
     }
 }

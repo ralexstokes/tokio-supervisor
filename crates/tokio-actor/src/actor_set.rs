@@ -3,7 +3,7 @@ use std::{
     future::Future,
     io::Error as IoError,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::{
-    actor::{ActorSpecInner, BoxError},
+    actor::{ActorSpec, ActorSpecInner, BoxError},
     binding::{MailboxBinding, MailboxBindingGuard, MailboxRef},
     blocking::{BlockingRuntime, BlockingRuntimeEvent},
     context::{ActorContext, ActorRef},
@@ -22,6 +22,7 @@ use crate::{
     graph::GraphInner,
     ingress::IngressHandle,
     observability::ActorExitStatus,
+    registry::{ActorRegistry, RegistryError},
 };
 
 /// Errors returned from [`RunnableActor::run_until`].
@@ -50,6 +51,17 @@ struct ActorSetInner {
     actor_index: HashMap<Arc<str>, usize>,
 }
 
+/// Factory for constructing runtime-added actors that share the same
+/// per-graph execution settings as an existing actor set.
+#[derive(Clone, Debug)]
+pub struct RunnableActorFactory {
+    observability: crate::observability::GraphObservability,
+    mailbox_capacity: usize,
+    max_envelope_bytes: Option<usize>,
+    max_blocking_tasks_per_actor: Option<usize>,
+    blocking_shutdown_timeout: std::time::Duration,
+}
+
 impl ActorSet {
     pub(crate) fn from_graph(graph: Arc<GraphInner>) -> Result<Self, GraphError> {
         let mut actors = Vec::with_capacity(graph.actors.len());
@@ -71,6 +83,7 @@ impl ActorSet {
                     binding,
                     peers,
                     myself,
+                    registry: OnceLock::new(),
                     mailbox_capacity: graph.mailbox_capacity,
                     max_envelope_bytes: graph.max_envelope_bytes,
                     max_blocking_tasks_per_actor: graph.max_blocking_tasks_per_actor,
@@ -105,6 +118,18 @@ impl ActorSet {
         &self.inner.actors
     }
 
+    /// Returns a factory for constructing additional runnable actors that use
+    /// the same runtime configuration as this actor set.
+    pub fn dynamic_factory(&self) -> RunnableActorFactory {
+        RunnableActorFactory {
+            observability: self.inner.graph.observability.clone(),
+            mailbox_capacity: self.inner.graph.mailbox_capacity,
+            max_envelope_bytes: self.inner.graph.max_envelope_bytes,
+            max_blocking_tasks_per_actor: self.inner.graph.max_blocking_tasks_per_actor,
+            blocking_shutdown_timeout: self.inner.graph.blocking_shutdown_timeout,
+        }
+    }
+
     /// Returns a stable handle to a named ingress, if it exists.
     pub fn ingress(&self, name: &str) -> Option<IngressHandle> {
         self.inner.graph.ingress_handle(name)
@@ -132,6 +157,7 @@ struct RunnableActorInner {
     binding: Arc<MailboxBinding>,
     peers: HashMap<Arc<str>, ActorRef>,
     myself: ActorRef,
+    registry: OnceLock<ActorRegistry>,
     mailbox_capacity: usize,
     max_envelope_bytes: Option<usize>,
     max_blocking_tasks_per_actor: Option<usize>,
@@ -145,6 +171,30 @@ impl RunnableActor {
     /// Returns the actor id.
     pub fn id(&self) -> &str {
         &self.inner.spec.id
+    }
+
+    /// Returns a stable actor reference for this actor.
+    pub fn actor_ref(&self) -> ActorRef {
+        ActorRef::from_binding(
+            Arc::clone(&self.inner.spec.id),
+            self.inner.binding.subscribe(),
+            self.inner.observability.clone(),
+            None,
+        )
+    }
+
+    /// Registers this actor in a runtime registry.
+    pub fn register_with(&self, registry: &ActorRegistry) -> Result<(), RegistryError> {
+        registry.register_entry(
+            Arc::clone(&self.inner.spec.id),
+            Arc::clone(&self.inner.binding),
+            self.inner.observability.clone(),
+        )
+    }
+
+    /// Sets the runtime actor registry visible to this actor.
+    pub fn set_registry(&self, registry: ActorRegistry) {
+        let _ = self.inner.registry.set(registry);
     }
 
     /// Runs this actor with a fresh mailbox until shutdown resolves.
@@ -169,6 +219,7 @@ impl RunnableActor {
             .inner
             .observability
             .actor_span(&actor_id, self.inner.peers.len());
+        let registry = self.inner.registry.get().cloned();
         let mut actor_task = AbortOnDrop::new(tokio::spawn({
             let actor_id = Arc::clone(&actor_id);
             let spec = Arc::clone(&self.inner.spec);
@@ -192,6 +243,7 @@ impl RunnableActor {
                     id: Arc::clone(&actor_id),
                     mailbox: receiver,
                     peers,
+                    registry,
                     myself,
                     shutdown: actor_shutdown.clone(),
                     blocking: blocking.spawner(),
@@ -296,6 +348,72 @@ impl std::fmt::Debug for RunnableActor {
         f.debug_struct("RunnableActor")
             .field("id", &self.id())
             .finish_non_exhaustive()
+    }
+}
+
+impl RunnableActorFactory {
+    /// Constructs a runtime actor with no statically-linked peers.
+    pub fn actor(&self, spec: ActorSpec) -> RunnableActor {
+        self.actor_with_peers(spec, HashMap::new())
+    }
+
+    /// Constructs a runtime actor whose initial peer map is resolved from the
+    /// provided registry.
+    pub fn actor_with_peer_ids<I, S>(
+        &self,
+        spec: ActorSpec,
+        registry: &ActorRegistry,
+        peer_ids: I,
+    ) -> Result<RunnableActor, RegistryError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let actor_id = Arc::clone(&spec.inner.id);
+        let mut peers = HashMap::new();
+
+        for peer_id in peer_ids {
+            let peer_id = peer_id.as_ref();
+            let peer = registry
+                .actor_ref_for_source(peer_id, Some(&actor_id))
+                .ok_or_else(|| RegistryError::UnknownActorId(peer_id.to_owned()))?;
+            peers.insert(peer_id.into(), peer);
+        }
+
+        Ok(self.actor_with_peers(spec, peers))
+    }
+
+    fn actor_with_peers(
+        &self,
+        spec: ActorSpec,
+        peers: HashMap<Arc<str>, ActorRef>,
+    ) -> RunnableActor {
+        let actor_id = Arc::clone(&spec.inner.id);
+        let binding = Arc::new(MailboxBinding::default());
+        let observability = self.observability.clone();
+        let myself = ActorRef::from_binding(
+            Arc::clone(&actor_id),
+            binding.subscribe(),
+            observability.clone(),
+            Some(Arc::clone(&actor_id)),
+        );
+
+        RunnableActor {
+            inner: Arc::new(RunnableActorInner {
+                spec: Arc::clone(&spec.inner),
+                binding,
+                peers,
+                myself,
+                registry: OnceLock::new(),
+                mailbox_capacity: self.mailbox_capacity,
+                max_envelope_bytes: self.max_envelope_bytes,
+                max_blocking_tasks_per_actor: self.max_blocking_tasks_per_actor,
+                blocking_shutdown_timeout: self.blocking_shutdown_timeout,
+                observability,
+                ingress_names: Vec::new(),
+                running: AtomicBool::new(false),
+            }),
+        }
     }
 }
 
