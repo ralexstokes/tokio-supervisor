@@ -40,6 +40,13 @@ pub enum ActorRunError {
     },
 }
 
+/// Decomposed actor graph where each actor can be run independently.
+///
+/// Created via [`Graph::into_actor_set`](crate::Graph::into_actor_set). Once
+/// decomposed, individual actors can be supervised as separate children (e.g.
+/// by `tokio-supervisor`), each with its own restart and shutdown policies.
+/// Stable peer wiring and ingress handles remain functional across independent
+/// actor restarts.
 #[derive(Clone)]
 pub struct ActorSet {
     inner: Arc<ActorSetInner>,
@@ -147,6 +154,12 @@ impl std::fmt::Debug for ActorSet {
     }
 }
 
+/// A single actor extracted from a graph, ready to be run independently.
+///
+/// Retains stable peer wiring and mailbox bindings from the original graph,
+/// so [`ActorRef`] and [`IngressHandle`] handles keep working across restarts.
+/// Use [`run_until`](Self::run_until) to drive the actor until a shutdown
+/// future resolves.
 #[derive(Clone)]
 pub struct RunnableActor {
     inner: Arc<RunnableActorInner>,

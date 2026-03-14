@@ -9,8 +9,8 @@ use crate::error::BuildError;
 pub enum Restart {
     /// Always restart the child, regardless of exit status.
     Permanent,
-    /// Restart only on failure (the child returned an `Err`). A clean `Ok(())`
-    /// exit is treated as intentional completion.
+    /// Restart only on failure (`Err`, panic, or abort). A clean `Ok(())`
+    /// exit is treated as intentional completion and is not restarted.
     #[default]
     Transient,
     /// Never restart. The child runs at most once and is not restarted after

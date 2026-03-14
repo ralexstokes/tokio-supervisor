@@ -136,6 +136,20 @@
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
 //! | `metrics` | no | Enables `metrics` crate integration for counters, gauges, and histograms. |
+//!
+//! # Examples
+//!
+//! - `examples/ingress_rebind.rs` — stable ingress handles across graph reruns.
+//! - `examples/send_vs_send_when_ready.rs` — retry-across-restart semantics.
+//! - `examples/mailbox_backpressure.rs` — bounded mailbox back-pressure.
+//! - `examples/envelope_limits.rs` — per-graph envelope size limits.
+//! - `examples/blocking_work.rs` — spawning tracked blocking tasks.
+//! - `examples/blocking_lifecycle.rs` — blocking task lifecycle handling.
+//! - `examples/blocking_limits.rs` — per-actor blocking task concurrency.
+//! - `examples/graph_failures.rs` — error propagation from actor failures.
+//! - `examples/builder_validation.rs` — build-time graph validation errors.
+//! - `examples/tracing.rs` — structured logging output.
+//! - `examples/metrics.rs` — metrics integration (requires `--features metrics`).
 
 mod actor;
 mod actor_set;

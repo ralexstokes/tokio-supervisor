@@ -15,7 +15,12 @@ use crate::{
     registry::ActorRegistry,
 };
 
-/// Cloneable sender for an actor mailbox.
+/// Cloneable, restart-stable sender for an actor mailbox.
+///
+/// An `ActorRef` is bound to a long-lived mailbox binding rather than a single
+/// actor runtime instance. When the target actor is restarted (either as part
+/// of a graph rerun or via per-actor supervision), the handle transparently
+/// follows the new mailbox.
 #[derive(Clone, Debug)]
 pub struct ActorRef {
     actor_id: Arc<str>,
@@ -227,6 +232,13 @@ impl ActorRef {
 }
 
 /// Runtime context passed to a graph actor each time the graph is run.
+///
+/// Provides the actor's incoming [`mailbox`](Self::recv), stable
+/// [`peer`](Self::peer) references for linked actors, an optional
+/// [`registry`](Self::registry) for runtime-discovered actors, a
+/// [`shutdown_token`](Self::shutdown_token) for cooperative shutdown, and
+/// [`spawn_blocking`](Self::spawn_blocking) /
+/// [`run_blocking`](Self::run_blocking) for tracked blocking work.
 pub struct ActorContext {
     pub(crate) id: Arc<str>,
     pub(crate) mailbox: mpsc::Receiver<Envelope>,
